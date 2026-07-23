@@ -1,0 +1,82 @@
+DATA SIGNAL ARCHITECTURE
+========================
+
+A. LIVE SIGNAL PATH (runs continuously, every session)
+--------------------------------------------------------
+1. Sensors (GSR AFE, SEN0344 PPG, SEN0142 IMU, LM75BD temp) sampled
+   on ESP-32, each at native rate
+
+2. ESP-32 batches samples per stream, sends as WebSocket packets
+
+3. Host laptop receives stream, demuxes by stream type
+
+4. Host buffers each stream into its sliding window
+   - short window: PPG/IMU
+   - long window: GSR
+   - temperature attached as slow-context, not separately windowed
+
+5. Feature extraction runs per-window, per-stream
+   (same functions used in training — shared codebase)
+
+6. On GSR window close: aggregate buffered short-window features
+   + GSR features -> single fusion vector
+
+7. Fusion vector fed into the pre-trained model
+   (loaded once at startup, NOT retrained live)
+   -> outputs predicted WESAD state (baseline / stress / amusement) + current HR
+
+8. Host packages result (predicted state + HR) into a small message,
+   sends back over the same WebSocket connection to the ESP-32
+   - only fires once per GSR window close (~60s cadence), not per packet
+
+9. ESP-32 receives message, writes relevant fields to the SSD1306 OLED
+   over I2C
+
+
+B. MODEL TRAINING PATH (offline, one-time, before A ever runs)
+--------------------------------------------------------
+1. Get WESAD, extract wrist-relevant channels (EDA, BVP->HR, ACC)
+
+2. Match WESAD's rates/windows to the live pipeline's scheme
+
+3. Run the SAME feature-extraction functions from A.5 on WESAD
+   (shared code, not reimplemented)
+
+4. Label windows using WESAD's condition timestamps
+   - drop windows straddling label transitions
+
+5. Split by subject (leave-one-subject-out)
+   - NOT random window shuffle (avoids subject leakage between
+     train/test)
+
+6. Train a baseline model (tree-based first), evaluate per-subject
+
+7. Normalize to handle the domain gap between Empatica-grade WESAD
+   sensors and custom AFE/breakouts
+
+8. Serialize the trained model to disk
+
+
+C. CONNECTING A AND B
+--------------------------------------------------------
+The serialized model from B.8 is loaded once when the host pipeline
+script starts (A begins). Nothing in A ever touches WESAD directly —
+B only exists to produce the artifact A.7 loads.
+
+
+SCOPE NOTES / DECISIONS
+--------------------------------------------------------
+- HRV excluded from targets: SEN0344 v2.0 blocks raw MAX30102 FIFO
+  access, only outputs pre-computed HR. HRV needs raw waveform
+  inter-beat intervals, which are not accessible without bypassing
+  the DFRobot library.
+- SpO2 excluded from ML pipeline scope: correct framing is lack of
+  raw dual-channel data access needed to validate it, not a hardware
+  limitation.
+- Output target is WESAD's labeled conditions (baseline / stress /
+  amusement), not discrete emotion categories (e.g. anger) — GSR/HR
+  arousal signatures are not emotion-specific, this is a known
+  specificity limitation in psychophysiology literature.
+- IMU role: distinguishes movement-driven physiological change from
+  stress-driven change (confound rejection), not just an additional
+  fused feature.
