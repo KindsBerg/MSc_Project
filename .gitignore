@@ -1,0 +1,26 @@
+# WESAD dataset — ~2 GB of pickles, redistribution not yours to make
+WESAD/
+cache/
+
+# Machine-specific paths
+config.py
+
+# Model artefacts — regenerable, and joblib files are large binaries
+models/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+*.egg-info/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Notebooks
+.ipynb_checkpoints/

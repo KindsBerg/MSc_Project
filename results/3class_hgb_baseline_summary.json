@@ -1,0 +1,13 @@
+{
+  "task": "3class",
+  "model": "hgb",
+  "n_folds": 15,
+  "accuracy_mean": 0.8239401063508731,
+  "accuracy_sd": 0.12890560444897495,
+  "balanced_acc_mean": 0.7315489403026779,
+  "balanced_acc_sd": 0.16722190432790507,
+  "macro_f1_mean": 0.7036841894187573,
+  "macro_f1_sd": 0.19403442063906803,
+  "pooled_macro_f1": 0.7479151060669699,
+  "standardise": "baseline"
+}
