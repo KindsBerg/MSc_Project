@@ -12,8 +12,8 @@ analogue in this project's hardware.
 Usage:
     from wesad_loader import load_subject, SUBJECTS, WRIST_FS
     s = load_subject("S2", root=r"C:\\dev\\wesad\\raw\\WESAD")
-    s.eda      # (N,) float array @ 4 Hz
-    s.label_at(s.t("eda"))   # label per EDA sample
+    s.eda                       # (N,) float array @ 4 Hz
+    s.window_label(0.0, 60.0)   # single label for the [0, 60) s window, or None
 """
 
 from __future__ import annotations
@@ -45,21 +45,16 @@ class Subject:
     """One WESAD subject's wrist streams plus the raw 700 Hz label track."""
 
     sid: str
-    acc: np.ndarray  # (N, 3) @ 32 Hz
-    bvp: np.ndarray  # (N,)   @ 64 Hz
-    eda: np.ndarray  # (N,)   @ 4 Hz
-    temp: np.ndarray  # (N,)  @ 4 Hz
-    label: np.ndarray  # (N,) @ 700 Hz, int
+    acc: np.ndarray    # (N, 3) @ 32 Hz
+    bvp: np.ndarray    # (N,)   @ 64 Hz
+    eda: np.ndarray    # (N,)   @ 4 Hz
+    temp: np.ndarray   # (N,)   @ 4 Hz
+    label: np.ndarray  # (M,)   @ 700 Hz, int
 
-    # ---- time bases -----------------------------------------------------
+    # ---- streams --------------------------------------------------------
 
     def stream(self, name: str) -> np.ndarray:
         return getattr(self, name)
-
-    def t(self, name: str) -> np.ndarray:
-        """Sample times in seconds for the named wrist stream."""
-        n = len(self.stream(name))
-        return np.arange(n, dtype=np.float64) / WRIST_FS[name]
 
     def duration(self) -> float:
         """Recording duration bounded by the shortest available track."""
@@ -68,16 +63,6 @@ class Subject:
         return float(min(ends))
 
     # ---- labels ---------------------------------------------------------
-
-    def label_at(self, t_sec: np.ndarray) -> np.ndarray:
-        """Nearest-sample label lookup for arbitrary times, clipped in range."""
-        idx = np.rint(np.asarray(t_sec, dtype=np.float64) * LABEL_FS).astype(int)
-        idx = np.clip(idx, 0, len(self.label) - 1)
-        return self.label[idx]
-
-    def label_for(self, name: str) -> np.ndarray:
-        """Label aligned to each sample of the named wrist stream."""
-        return self.label_at(self.t(name))
 
     def window_label(self, t0: float, t1: float, purity: float = 0.9):
         """Single label for the window [t0, t1) or None if impure/out of scope.
@@ -105,10 +90,8 @@ def load_subject(sid: str, root: str | Path) -> Subject:
     path = Path(root) / sid / f"{sid}.pkl"
     if not path.is_file():
         raise FileNotFoundError(f"missing pickle: {path}")
-
     with open(path, "rb") as f:
         d = pickle.load(f, encoding="latin1")  # Python 2 pickle
-
     w = d["signal"]["wrist"]
 
     def flat(a):
@@ -122,21 +105,3 @@ def load_subject(sid: str, root: str | Path) -> Subject:
         temp=flat(w["TEMP"]),
         label=np.asarray(d["label"]).reshape(-1).astype(np.int16),
     )
-
-
-def load_all(root: str | Path, subjects=None):
-    """Yield (sid, Subject) for each subject. Generator — one in memory at a time."""
-    for sid in subjects or SUBJECTS:
-        yield sid, load_subject(sid, root)
-
-
-def label_distribution(sub: Subject) -> dict:
-    """Fraction of in-scope 700 Hz label samples per kept class."""
-    lab = sub.label
-    keep = np.isin(lab, KEEP_LABELS)
-    total = int(keep.sum())
-    if total == 0:
-        return {}
-    return {
-        LABEL_NAMES[c]: float((lab == c).sum()) / total for c in KEEP_LABELS
-    }
