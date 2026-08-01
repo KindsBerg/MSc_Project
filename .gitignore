@@ -15,6 +15,7 @@ __pycache__/
 venv/
 env/
 *.egg-info/
+python_practice.py
 
 # Editors / OS
 .vscode/
