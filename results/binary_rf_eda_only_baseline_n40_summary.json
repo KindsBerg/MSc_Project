@@ -1,0 +1,19 @@
+{
+  "task": "binary",
+  "model": "rf",
+  "feature_set": "eda_only",
+  "n_features": 10,
+  "contract_n_features": 36,
+  "n_folds": 15,
+  "accuracy_mean": 0.866681262629773,
+  "accuracy_sd": 0.11009630036231072,
+  "balanced_acc_mean": 0.828509393637136,
+  "balanced_acc_sd": 0.17037509984872334,
+  "macro_f1_mean": 0.8100169008530749,
+  "macro_f1_sd": 0.18687585242183907,
+  "pooled_macro_f1": 0.8361118049929565,
+  "worst_fold_macro_f1": 0.4556308832853729,
+  "best_fold_macro_f1": 1.0,
+  "standardise": "baseline",
+  "n_ref_windows": 40
+}

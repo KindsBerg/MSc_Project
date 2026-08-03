@@ -1,59 +1,40 @@
 """
 export_model.py — fit the final model on all subjects and freeze it for the
-live host pipeline.
+live host.
 
-Produces a single artefact (models/stress_model.joblib) containing the fitted
-classifier, the exact ordered feature list it was trained on, the cohort-level
-scaling fallback, and provenance metadata. Also provides StressModel, the
-class the live host imports to run inference.
+Produces models/stress_model.joblib containing the fitted classifier, the
+exact ordered feature list it was trained on, the cohort-level scaling
+fallback, and provenance. Also provides StressModel, the class the live host
+imports to run inference.
 
-Run:
     python export_model.py                       # fit 'clean', binary, RF
-    python export_model.py --task 3class
     python export_model.py --features eda_only   # deployment-realistic variant
     python export_model.py --verify              # load and self-test only
 
---------------------------------------------------------------------------
-Why this file exists rather than a bare pickle
---------------------------------------------------------------------------
+Why an artefact rather than a bare pickle
+-----------------------------------------
 A pickled estimator carries no record of what its columns MEAN. If the live
-feature module ever emits columns in a different order, or gains a feature,
-or loses one, a bare estimator will happily accept the array and return
-confident nonsense. There is no error, no warning, and the failure is
-invisible until someone checks the predictions against reality.
+feature module emits columns in a different order, or gains or loses one, a
+bare estimator accepts the array and returns confident nonsense — no error, no
+warning. So the feature list is frozen into the artefact and checked on every
+load and every predict.
 
-So the feature list is frozen INTO the artefact and verified on every load
-and every predict call. A mismatch raises. That is the whole point.
-
---------------------------------------------------------------------------
 The t_start prohibition
---------------------------------------------------------------------------
-t_start (seconds since recording start) was used as a diagnostic probe during
-evaluation, where it scored ~0.96 balanced accuracy alone — higher than any
-physiological model — because WESAD runs its condition blocks in a fixed
-order at similar wall-clock offsets for every subject.
+-----------------------
+t_start scored ~0.96 balanced accuracy alone under LOSO, higher than any
+physiological model, because WESAD runs its condition blocks in a fixed order
+at similar wall-clock offsets for every subject. It has no meaning at
+inference: live monitoring has no protocol and no session start that predicts
+anything. Asserted at export, at load and at predict.
 
-It has NO meaning at inference. Live monitoring has no protocol, no fixed
-block ordering, and no session start that predicts anything. A model
-containing t_start would be reading a clock that no longer ticks.
-
-This is asserted at export, at load, and at predict. Three times, because
-this is the single most damaging thing that could silently enter the
-deployed artefact.
-
---------------------------------------------------------------------------
 Standardisation at inference
---------------------------------------------------------------------------
-The training-time scaling is per-subject: each subject is centred and scaled
-by the median and IQR of their own first N_REF_WINDOWS windows. That
-procedure is causal and transfers directly to deployment — but the PARAMETERS
-do not. A new user's reference must be computed from THEIR first windows of
-wear, not inherited from WESAD subjects.
-
-So the artefact exports the PROCEDURE plus the cohort-level IQR fallback,
-and StressModel accumulates a live reference buffer. Until that buffer is
-full the model reports itself as not ready, rather than predicting against a
-half-formed reference.
+----------------------------
+Training-time scaling is per-subject: centred and scaled by the median and IQR
+of that subject's first N_REF_WINDOWS windows. The PROCEDURE transfers to
+deployment; the PARAMETERS do not. A new wearer's reference must come from
+their own first windows of wear. So the artefact exports the procedure plus
+the cohort IQR fallback, and StressModel accumulates a live reference buffer,
+reporting itself not ready until that buffer is full.
 """
 
 from __future__ import annotations
@@ -72,13 +53,13 @@ import features as F
 from train_model import (
     FEATURE_SETS,
     N_REF_WINDOWS,
-    STRESS_LABEL,
     TIME_COL,
     Z_CLIP,
     load_table,
     make_model,
     make_target,
     resolve_features,
+    result_tag,
 )
 
 MODEL_DIR = Path("models")
@@ -87,12 +68,7 @@ RESULTS_DIR = Path("results")
 ARTEFACT_VERSION = 1
 
 # Feature sets that may never be exported: they contain the time probe.
-FORBIDDEN_SETS = {"time_only", "clean_plus_time", "eda_plus_time"}
-
-
-# --------------------------------------------------------------------------
-# Contract enforcement
-# --------------------------------------------------------------------------
+FORBIDDEN_SETS = {"time_only"}
 
 
 def assert_no_time_feature(cols) -> None:
@@ -100,8 +76,7 @@ def assert_no_time_feature(cols) -> None:
     if TIME_COL in cols:
         raise ValueError(
             f"'{TIME_COL}' is present in the feature list. It is a diagnostic "
-            "probe with no meaning at inference — live monitoring has no "
-            "protocol clock. Refusing to export."
+            "probe with no meaning at inference. Refusing to export."
         )
     leaky = [c for c in cols if c not in F.FEATURE_NAMES]
     if leaky:
@@ -113,16 +88,15 @@ def assert_no_time_feature(cols) -> None:
 
 
 # --------------------------------------------------------------------------
-# Reference statistics (the scaling procedure, not its parameters)
+# Reference statistics — the scaling procedure, not its parameters
 # --------------------------------------------------------------------------
 
 
 def compute_scale(ref: pd.DataFrame, wider: pd.DataFrame, cohort: pd.Series):
     """Robust centre and scale, with the divisor cascade from training.
 
-    Mirrors train_model.standardise exactly. Any change there must be
-    mirrored here or training and inference diverge silently — which is the
-    same class of bug the frozen feature list exists to prevent.
+    Mirrors train_model._standardise_core. Any change there must be mirrored
+    here or training and inference diverge silently.
     """
     centre = ref.median()
     iqr = ref.quantile(0.75) - ref.quantile(0.25)
@@ -133,12 +107,12 @@ def compute_scale(ref: pd.DataFrame, wider: pd.DataFrame, cohort: pd.Series):
     return centre, scale
 
 
-def training_standardise(df: pd.DataFrame, cols: list, cohort_iqr: pd.Series):
+def training_standardise(df: pd.DataFrame, cols: list, cohort_iqr: pd.Series, n_ref: int):
     """Apply per-subject scaling to the training table, as at evaluation."""
     out = df.copy()
     for sid, idx in df.groupby("subject").groups.items():
         block = df.loc[idx, cols]
-        ref = df.loc[idx].sort_values(TIME_COL).head(N_REF_WINDOWS)[cols]
+        ref = df.loc[idx].sort_values(TIME_COL).head(n_ref)[cols]
         if len(ref) < 5:
             raise ValueError(f"{sid}: too few reference windows ({len(ref)})")
         centre, scale = compute_scale(ref, block, cohort_iqr[cols])
@@ -153,20 +127,16 @@ def training_standardise(df: pd.DataFrame, cols: list, cohort_iqr: pd.Series):
 
 
 class StressModel:
-    """Load-and-predict wrapper for the live host pipeline.
+    """Load-and-predict wrapper for the live host.
 
-    Usage:
         m = StressModel.load("models/stress_model.joblib")
-
-        # During the opening minutes of wear, feed reference windows:
-        for row in warmup_rows:            # dicts from features.feature_vector
+        for row in warmup_rows:        # dicts from features.feature_vector
             m.add_reference(row)
-
         if m.ready:
             label, proba = m.predict(row)
 
     The reference buffer is per-wearer and per-session. Call reset() when the
-    device is removed or a new user puts it on — a reference built on one
+    device comes off or a new user puts it on — a reference built on one
     person's resting physiology is meaningless for another.
     """
 
@@ -184,8 +154,6 @@ class StressModel:
         self._ref_rows: list = []
         self._centre = None
         self._scale = None
-
-    # -- construction ----------------------------------------------------
 
     @classmethod
     def load(cls, path: str | Path) -> "StressModel":
@@ -246,16 +214,14 @@ class StressModel:
                 f"{missing[:5]}{'...' if len(missing) > 5 else ''}. The live "
                 "feature module and the trained model have diverged."
             )
-        return pd.Series(
-            {c: float(row[c]) for c in self.feature_names}, dtype=np.float64
-        )
+        return pd.Series({c: float(row[c]) for c in self.feature_names}, dtype=np.float64)
 
     def transform(self, row: dict) -> np.ndarray:
         if not self.ready:
             raise RuntimeError(
                 f"reference incomplete: {self.n_reference}/{self.n_ref_required} "
-                "windows. Predicting before the wearer's resting reference is "
-                "established would compare them against nothing."
+                "windows. Predicting before the wearer's resting reference "
+                "exists would compare them against nothing."
             )
         s = self._row_to_series(row)
         z = ((s - self._centre) / self._scale).clip(-self.z_clip, self.z_clip)
@@ -268,13 +234,8 @@ class StressModel:
         proba = {}
         if hasattr(self.clf, "predict_proba"):
             p = self.clf.predict_proba(x)[0]
-            proba = {
-                self.class_names[int(c)]: float(v)
-                for c, v in zip(self.clf.classes_, p)
-            }
+            proba = {self.class_names[int(c)]: float(v) for c, v in zip(self.clf.classes_, p)}
         return self.class_names[idx], proba
-
-    # -- introspection ---------------------------------------------------
 
     def describe(self) -> str:
         m = self.bundle["metadata"]
@@ -283,8 +244,7 @@ class StressModel:
             f"({len(self.feature_names)})\n"
             f"trained {m['exported_utc']} on {m['n_train_windows']} windows "
             f"from {m['n_train_subjects']} subjects\n"
-            f"LOSO balanced accuracy at evaluation: "
-            f"{m.get('loso_balanced_acc', 'n/a')}\n"
+            f"LOSO balanced accuracy at evaluation: {m.get('loso_balanced_acc', 'n/a')}\n"
             f"reference required before inference: {self.n_ref_required} windows"
         )
 
@@ -294,9 +254,13 @@ class StressModel:
 # --------------------------------------------------------------------------
 
 
-def load_loso_summary(task: str, model: str, feature_set: str):
-    """Attach the evaluation result to the artefact, if it exists."""
-    p = RESULTS_DIR / f"{task}_{model}_{feature_set}_baseline_summary.json"
+def load_loso_summary(task: str, model: str, feature_set: str, n_ref: int):
+    """Attach the evaluation result to the artefact, if it exists.
+
+    Uses train_model.result_tag so the filename always matches whatever
+    train_model wrote for the same configuration and buffer size.
+    """
+    p = RESULTS_DIR / f"{result_tag(task, model, feature_set, 'baseline', n_ref)}_summary.json"
     if not p.is_file():
         return None
     try:
@@ -312,6 +276,7 @@ def export(
     feature_set: str,
     seed: int,
     outfile: Path,
+    n_ref: int = N_REF_WINDOWS,
 ) -> Path:
     import joblib
     import sklearn
@@ -319,29 +284,28 @@ def export(
     if feature_set in FORBIDDEN_SETS:
         raise ValueError(
             f"feature set '{feature_set}' contains the time probe and cannot "
-            f"be deployed. Use 'clean' or 'eda_only'."
+            "be deployed. Use 'clean' or 'eda_only'."
         )
 
     df = load_table(cache)
     cols = resolve_features(feature_set, df)
     assert_no_time_feature(cols)
 
-    cohort_iqr = df[F.FEATURE_NAMES].quantile(0.75) - df[F.FEATURE_NAMES].quantile(
-        0.25
-    )
-    scaled = training_standardise(df, cols, cohort_iqr)
+    cohort_iqr = df[F.FEATURE_NAMES].quantile(0.75) - df[F.FEATURE_NAMES].quantile(0.25)
+    scaled = training_standardise(df, cols, cohort_iqr, n_ref)
 
     X = scaled[cols].to_numpy(dtype=np.float64)
     y, class_names = make_target(df, task)
 
-    print(f"fitting {model_kind} on {len(X)} windows, {len(cols)} features")
+    print(f"fitting {model_kind} on {len(X)} windows, {len(cols)} features, n_ref={n_ref}")
     clf = make_model(model_kind, seed).fit(X, y)
 
-    loso = load_loso_summary(task, model_kind, feature_set)
+    loso = load_loso_summary(task, model_kind, feature_set, n_ref)
     metadata = {
         "task": task,
         "model": model_kind,
         "feature_set": feature_set,
+        "n_ref_windows": n_ref,
         "n_train_windows": int(len(X)),
         "n_train_subjects": int(df["subject"].nunique()),
         "class_balance": df["label_name"].value_counts(normalize=True).round(4).to_dict(),
@@ -350,18 +314,16 @@ def export(
         "numpy_version": np.__version__,
         "python_version": platform.python_version(),
         "seed": seed,
-        "loso_balanced_acc": (
-            round(loso["balanced_acc_mean"], 4) if loso else None
-        ),
-        "loso_balanced_acc_sd": (round(loso["balanced_acc_sd"], 4) if loso else None),
+        "loso_balanced_acc": round(loso["balanced_acc_mean"], 4) if loso else None,
+        "loso_balanced_acc_sd": round(loso["balanced_acc_sd"], 4) if loso else None,
         "loso_macro_f1": round(loso["macro_f1_mean"], 4) if loso else None,
         # Recorded so the deployed artefact carries the caveat with it.
         "evaluation_caveat": (
             "WESAD runs its condition blocks in a fixed order, so elapsed "
-            "session time alone reaches ~0.96 binary / ~0.90 3-class balanced "
-            "accuracy under LOSO. Published WESAD benchmarks are therefore "
-            "upper bounds of uncertain composition. Field performance without "
-            "a protocol clock is expected to be lower than the LOSO figure."
+            "session time alone reaches ~0.96 binary balanced accuracy under "
+            "LOSO. Published WESAD benchmarks are therefore upper bounds of "
+            "uncertain composition. Field performance without a protocol clock "
+            "is expected to be lower than the LOSO figure."
         ),
     }
 
@@ -371,25 +333,20 @@ def export(
         "feature_names": cols,
         "class_names": class_names,
         "cohort_iqr": cohort_iqr.to_dict(),
-        "n_ref_windows": N_REF_WINDOWS,
+        "n_ref_windows": n_ref,
         "z_clip": Z_CLIP,
         "metadata": metadata,
     }
 
     outfile.parent.mkdir(parents=True, exist_ok=True)
     joblib.dump(bundle, outfile)
-    (outfile.with_suffix(".json")).write_text(
+    outfile.with_suffix(".json").write_text(
         json.dumps({**metadata, "feature_names": cols}, indent=2)
     )
 
     print(f"\nexported -> {outfile}")
     print(f"sidecar   -> {outfile.with_suffix('.json')}")
     return outfile
-
-
-# --------------------------------------------------------------------------
-# Verification
-# --------------------------------------------------------------------------
 
 
 def verify(path: Path, cache: Path) -> int:
@@ -442,21 +399,19 @@ def verify(path: Path, cache: Path) -> int:
     return 0
 
 
-# --------------------------------------------------------------------------
-# Entry point
-# --------------------------------------------------------------------------
-
-
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--cache", default="cache")
     ap.add_argument("--task", choices=["binary", "3class"], default="binary")
-    ap.add_argument("--model", choices=["rf", "hgb"], default="rf")
+    ap.add_argument("--model", choices=["rf"], default="rf")
     ap.add_argument(
         "--features",
         choices=sorted(set(FEATURE_SETS) - FORBIDDEN_SETS),
         default="clean",
     )
+    ap.add_argument("--baseline-n", type=int, default=N_REF_WINDOWS,
+                    help=f"reference buffer frozen into the artefact "
+                         f"(default {N_REF_WINDOWS}; must match training)")
     ap.add_argument("--out", default=None)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--verify", action="store_true", help="verify existing artefact")
@@ -477,6 +432,7 @@ def main() -> int:
         feature_set=args.features,
         seed=args.seed,
         outfile=out,
+        n_ref=args.baseline_n,
     )
     print()
     return verify(out, Path(args.cache))

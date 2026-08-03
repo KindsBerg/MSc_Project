@@ -1,77 +1,40 @@
 """
-features.py — THE shared feature module.
+features.py — the shared feature module.
 
-This file is imported by BOTH the WESAD training script and the live host
-pipeline. It is the single implementation of every feature. Nothing here may
-depend on which side is calling it, and no feature may be computed anywhere
-else in the project.
+Imported by BOTH the WESAD training pipeline and the live host. It is the only
+place any feature is computed. Same columns, same order, same per-stream
+window, on both sides. FEATURE_NAMES is the single source of truth for that
+order and feature_vector() checks against it on every call, so a drift raises
+instead of silently misaligning the model against its input.
 
-Feature parity is a hard rule: the same columns, in the same order, over the
-same per-stream window, in training and at inference. FEATURE_NAMES is the
-single source of truth for that order; feature_vector() asserts against it on
-every call so a drift becomes an immediate error rather than a silent
-misalignment between the trained model and the live input.
+Exclusions, and why (see WESAD_NOTES §2.2):
 
---------------------------------------------------------------------------
-Design constraints inherited from the sensor set (see WESAD_NOTES §2.2)
---------------------------------------------------------------------------
-* NO HRV. RMSSD/SDNN/pNN50/LF/HF all need beat-to-beat intervals from raw
-  BVP. The SEN0344 v2.0 firmware does not expose the MAX30102 FIFO, so only
-  a computed HR number is available. The HR block is therefore statistics on
-  the HR *number*, not on a pulse waveform. SD_HR below is the variability of
-  the HR trend and must never be described as HRV.
-* NO GYROSCOPE in the trained vector. The MPU6050 has a gyro; the Empatica
-  E4 that recorded WESAD does not. Features are extracted on the
-  intersection of the two, not the union, so gyro is excluded here. It may
-  still be logged and used for live signal-quality gating outside the model.
-* NO SpO2. Same data-access reason as HRV.
-* NO TEMPERATURE. This is the newest exclusion and the reasoning differs
-  from the three above, so it is set out in full below.
+  NO HRV      RMSSD/SDNN/pNN50/LF/HF all need beat-to-beat intervals. The
+              SEN0344 v2.0 firmware does not expose the MAX30102 FIFO, so only
+              a computed HR number is available. The HR block is statistics on
+              that number. hr_sd is the variability of the HR trend and must
+              never be called HRV.
+  NO GYRO     The MPU6050 has one; the Empatica E4 that recorded WESAD does
+              not. Features come from the intersection of the two sensors.
+  NO SpO2     Same data-access reason as HRV.
+  NO TEMP     WESAD's TEMP is a skin thermistor. The LM75BD on this PCB reads
+              board temperature dominated by self-heating — a different
+              instrument measuring a different thing. Removing the block cost
+              -0.004 binary balanced accuracy (inside the +/-0.127 fold
+              spread), and its absolute features correlated with elapsed
+              session time at |r| ~ 0.65. Device thermal telemetry is handled
+              on the ESP32 and never enters the model.
 
---------------------------------------------------------------------------
-Why temperature is not a feature (added at the 36-feature revision)
---------------------------------------------------------------------------
-WESAD's TEMP channel is an isolated skin thermistor on an Empatica E4. The
-LM75BD on this project's PCB is not that instrument and was never mounted to
-be. It sits on the board, thermally coupled to the ESP32 and the regulators,
-and reads device temperature — its role in this build is thermal monitoring
-of power dissipation, not physiological sensing.
+Windows:
+  EDA        60 s, matching WESAD's own physiological window.
+  HR / IMU   WIN_SHORT_S, per the multi-rate architecture. WESAD HR features
+             are recomputed on this same short window so "mean HR" means the
+             same thing either side of the pipeline.
 
-Training a physiological feature on a skin thermistor and inferring it from a
-board sensor is a train/serve mismatch of kind, not of degree. Two supporting
-measurements from the ablation sweep (results/ablation_sweep.csv, retained
-in the repository as the evidence for this decision):
-
-  * Removing the whole TEMP block cost -0.004 binary balanced accuracy,
-    inside the +/-0.127 per-fold spread. On the headline task the block was
-    not carrying the result.
-  * Absolute temperature features correlated with elapsed session time at
-    |r| ~ 0.65 (results/time_confound.csv). Part of what they contributed
-    under LOSO was session position, which does not exist in live use.
-
-The block cost -0.057 on 3-class, where it helped separate amusement from
-baseline. That loss is accepted: 3-class is the secondary result and
-amusement is the acknowledged weak class.
-
-temp_features() is retained at the bottom of this file, OUTSIDE the feature
-contract, for device thermal telemetry. It is not called by feature_vector()
-and its output must never enter the model.
-
---------------------------------------------------------------------------
-Window scheme
---------------------------------------------------------------------------
-EDA       60 s — matches WESAD's own 60 s physiological window exactly.
-HR/IMU    WIN_SHORT_S — shorter, per the multi-rate architecture. WESAD HR
-          features MUST be recomputed on this same short window during
-          training, or "mean HR" means two different things either side of
-          the pipeline.
-
-WIN_SHORT_S is PROVISIONAL. It is set to 15 s pending measurement of the
-SEN0344's actual HR update cadence on the bench. If the sensor emits HR
-every ~1-4 s, a 15 s window holds only 4-15 samples and SD/slope will be
-coarse. Once the real cadence is known, set WIN_SHORT_S here and rebuild
-the WESAD feature table — it is a single constant precisely so that
-recomputation is cheap.
+WIN_SHORT_S is PROVISIONAL at 15 s, pending measurement of the SEN0344's real
+HR update cadence on the bench. If it emits HR every 1-4 s, a 15 s window
+holds only 4-15 samples and sd/slope will be coarse. It is one constant so
+that rebuilding the feature table afterwards is cheap.
 """
 
 from __future__ import annotations
@@ -82,42 +45,36 @@ import numpy as np
 from scipy import signal as sps
 
 # --------------------------------------------------------------------------
-# Window and threshold configuration — change here, nowhere else.
+# Configuration — change here, nowhere else.
 # --------------------------------------------------------------------------
 
-WIN_EDA_S = 60.0  # EDA window, matches WESAD
-WIN_SHORT_S = 15.0  # HR/IMU window — PROVISIONAL, see module docstring
-WIN_STEP_S = 5.0  # slide between consecutive EDA windows
+WIN_EDA_S = 60.0     # EDA window, matches WESAD
+WIN_SHORT_S = 15.0   # HR/IMU window — PROVISIONAL, see docstring
+WIN_STEP_S = 5.0     # slide between consecutive EDA windows
 WINDOW_PURITY = 0.9  # min fraction of agreeing labels for a valid window
 
-EDA_FS = 4.0  # Hz, WESAD wrist EDA and target for the live AFE
+EDA_FS = 4.0   # Hz, WESAD wrist EDA and the target for the live AFE
 ACC_FS = 32.0  # Hz, E4; MPU6050 configured to match
 
-# LM75BD sample rate. Device telemetry only — not a model input. Retained
-# here so the telemetry helper has a default and so the constant lives with
-# the other rates rather than drifting into firmware-side code.
-TEMP_FS = 4.0  # Hz
-
-# SCR detection: amplitude below this is treated as noise, not a response.
+# SCR amplitude below this is noise, not a response.
 SCR_MIN_AMP_US = 0.01
 
-# IMU motion gate. Std of 3D acceleration magnitude, in g, above which the
-# window is flagged as motion-contaminated. Provisional — retune against
-# your own worn recordings, then report the value used.
+# IMU motion gate: sd of 3-D acceleration magnitude, in g, above which a
+# window is flagged motion-contaminated. Provisional — retune against your own
+# worn recordings and report the value used.
 MOTION_STD_THRESHOLD_G = 0.05
 
 # Band for the accelerometer peak-frequency feature (human movement).
 ACC_BAND_HZ = (0.3, 10.0)
 
-# Run-time counters. cvxEDA occasionally fails to converge on a short window
-# and silently falls back to the median-filter decomposition; the fallback
-# rate is a number that belongs in the report, so it is counted rather than
-# lost. Reset with reset_stats() at the start of a batch run.
+# cvxEDA occasionally fails to converge on a short window and falls back to a
+# median-filter decomposition. The fallback rate belongs in the report, so it
+# is counted rather than lost. reset_stats() at the start of a batch run.
 STATS = {
     "eda_windows": 0,
     "cvxeda_ok": 0,
     "cvxeda_fallback": 0,
-    "cvxeda_error": None,   # first fallback reason, for diagnosis
+    "cvxeda_error": None,   # first fallback reason only
     "scr_windows": 0,
     "scr_fallback": 0,
     "scr_error": None,
@@ -130,7 +87,7 @@ def reset_stats() -> None:
 
 
 # --------------------------------------------------------------------------
-# Feature name registry — the contract between training and inference.
+# Feature registry — the contract between training and inference.
 # --------------------------------------------------------------------------
 
 EDA_FEATURES = [
@@ -170,81 +127,40 @@ CROSS_FEATURES = [
     "eda_range_gated",    # eda_range * (1 - motion_fraction)
 ]
 
-FEATURE_NAMES: list[str] = (
-    EDA_FEATURES + HR_FEATURES + IMU_FEATURES + CROSS_FEATURES
-)
-
+FEATURE_NAMES: list[str] = EDA_FEATURES + HR_FEATURES + IMU_FEATURES + CROSS_FEATURES
 N_FEATURES = len(FEATURE_NAMES)
 
-# Names that were in the contract before the 36-feature revision and must
-# never silently reappear. Anything downstream that still references these
-# (a stale feature-set definition, an old cached parquet, a joblib exported
-# from the 42-feature contract) should fail loudly rather than be tolerated.
-RETIRED_FEATURES: list[str] = [
-    "temp_mean",
-    "temp_min",
-    "temp_max",
-    "temp_range",
-    "temp_slope",
-    "temp_baseline_delta",
-]
-
-assert not (set(FEATURE_NAMES) & set(RETIRED_FEATURES))
 assert len(set(FEATURE_NAMES)) == N_FEATURES, "duplicate name in FEATURE_NAMES"
 
 
-def assert_no_retired(names) -> None:
-    """Raise if any retired feature name appears in `names`.
-
-    Call this wherever a feature list arrives from outside this module — a
-    loaded model artefact, a cached table's columns, a CLI feature-set
-    argument. A stale 42-column input silently accepted by a 36-column model
-    is exactly the failure mode the feature contract exists to prevent.
-    """
-    stale = sorted(set(names) & set(RETIRED_FEATURES))
-    if stale:
-        raise RuntimeError(
-            f"retired feature(s) present: {stale}. These were removed at the "
-            "36-feature revision; the source is from the old contract and "
-            "must be rebuilt, not coerced."
-        )
-
-
 # --------------------------------------------------------------------------
-# Small helpers
+# Helpers
 # --------------------------------------------------------------------------
 
 
 def _slope(x: np.ndarray, fs: float, t: np.ndarray | None = None) -> float:
-    """Least-squares slope in units per second. NaN if under two samples.
+    """Least-squares slope in units per second. NaN under two samples.
 
-    Pass `t` (seconds) explicitly whenever `x` has already had samples
-    dropped by a validity filter upstream. Reconstructing a contiguous
-    `arange(n)/fs` axis from a filtered array silently compresses whatever
-    gap the dropped samples left, biasing the slope on every window that
-    drops so much as one sample.
+    Pass `t` (seconds) whenever `x` has already had samples dropped by a
+    validity filter. Rebuilding a contiguous arange(n)/fs axis from a filtered
+    array compresses the gap the dropped samples left and biases the slope.
     """
     x = np.asarray(x, dtype=np.float64)
     n = x.size
     if n < 2:
         return np.nan
-    if t is None:
-        t = np.arange(n, dtype=np.float64) / fs
-    else:
-        t = np.asarray(t, dtype=np.float64)
+    t = np.arange(n, dtype=np.float64) / fs if t is None else np.asarray(t, dtype=np.float64)
     return float(np.polyfit(t, x, 1)[0])
 
 
 def _abs_integral(x: np.ndarray, fs: float) -> float:
     """Integral of |x| over the window, in signal-units x seconds."""
     x = np.asarray(x, dtype=np.float64)
-    if x.size == 0:
-        return np.nan
-    return float(np.sum(np.abs(x)) / fs)
+    return float(np.sum(np.abs(x)) / fs) if x.size else np.nan
 
 
 def _peak_freq(x: np.ndarray, fs: float, band=ACC_BAND_HZ) -> float:
-    """Dominant in-band frequency via periodogram. NaN if window too short."""
+    """Dominant in-band frequency via periodogram. NaN if the window is short."""
     x = np.asarray(x, dtype=np.float64)
     if x.size < 8:
         return np.nan
@@ -253,9 +169,7 @@ def _peak_freq(x: np.ndarray, fs: float, band=ACC_BAND_HZ) -> float:
         return 0.0
     f, p = sps.periodogram(x, fs=fs, scaling="density")
     sel = (f >= band[0]) & (f <= band[1])
-    if not sel.any():
-        return np.nan
-    return float(f[sel][int(np.argmax(p[sel]))])
+    return float(f[sel][int(np.argmax(p[sel]))]) if sel.any() else np.nan
 
 
 def _nan_block(names: list[str]) -> dict:
@@ -268,43 +182,33 @@ def _nan_block(names: list[str]) -> dict:
 
 
 def _decompose_eda(eda: np.ndarray, fs: float):
-    """Split EDA into tonic (SCL) and phasic (SCR) components.
+    """Split EDA into tonic (SCL) and phasic (SCR). Returns (tonic, phasic, used_cvxeda).
 
-    Prefers NeuroKit2's cvxEDA (Greco et al.), which is the modern convex
-    -optimisation replacement for WESAD's Choi decomposition. Falls back to a
-    median-filter tonic estimate if NeuroKit2 is unavailable or cvxEDA fails
-    to converge on a short 240-sample window, which it occasionally does.
-
-    Returns (tonic, phasic, used_cvxeda).
+    Prefers NeuroKit2's cvxEDA (Greco et al.), the convex-optimisation
+    replacement for WESAD's Choi decomposition. Falls back to a median-filter
+    tonic estimate if NeuroKit2 is missing or cvxEDA fails to converge.
     """
     try:
         import neurokit2 as nk
 
         df = nk.eda_phasic(eda, sampling_rate=fs, method="cvxeda")
-        return (
-            df["EDA_Tonic"].to_numpy(),
-            df["EDA_Phasic"].to_numpy(),
-            True,
-        )
+        return df["EDA_Tonic"].to_numpy(), df["EDA_Phasic"].to_numpy(), True
     except Exception as e:  # noqa: BLE001 — any failure falls back, by design
-        # Record the FIRST reason only. A 100% fallback rate means cvxEDA
-        # never ran at all (usually a missing `cvxopt` install), which is a
-        # different problem from occasional non-convergence and must not be
-        # allowed to look like one.
+        # First reason only. A 100% fallback rate means cvxEDA never ran at all
+        # (usually a missing cvxopt), which is a different problem from
+        # occasional non-convergence and must not look like one.
         if STATS["cvxeda_error"] is None:
             STATS["cvxeda_error"] = f"{type(e).__name__}: {e}"
-        # Median filter wide enough to pass SCL but reject SCRs (~1-5 s).
-        k = int(fs * 8) | 1  # odd kernel
-        k = max(k, 3)
-        if eda.size < k:
-            tonic = np.full_like(eda, np.median(eda))
-        else:
-            tonic = sps.medfilt(eda, kernel_size=k)
+        k = max(int(fs * 8) | 1, 3)  # odd kernel, wide enough to pass SCL
+        tonic = (
+            np.full_like(eda, np.median(eda)) if eda.size < k
+            else sps.medfilt(eda, kernel_size=k)
+        )
         return tonic, eda - tonic, False
 
 
 def _find_scrs(phasic: np.ndarray, fs: float):
-    """Detect SCRs, returning (amplitudes, rise_times_s, durations_s)."""
+    """Detect SCRs. Returns (amplitudes, rise_times_s, durations_s)."""
     STATS["scr_windows"] += 1
     try:
         import neurokit2 as nk
@@ -313,29 +217,23 @@ def _find_scrs(phasic: np.ndarray, fs: float):
         amp_raw = np.asarray(info.get("SCR_Amplitude", []), dtype=np.float64)
         rise_raw = np.asarray(info.get("SCR_RiseTime", []), dtype=np.float64)
         rec_raw = np.asarray(info.get("SCR_RecoveryTime", []), dtype=np.float64)
+
+        # `keep` is built against the RAW arrays and applied to all three
+        # identically, so amp/rise/rec stay aligned to the same peaks.
         keep = np.isfinite(amp_raw) & (amp_raw >= SCR_MIN_AMP_US)
-        # `keep` is built against the RAW (pre-filter) arrays and applied to
-        # all three identically, so amp/rise/rec stay index-aligned to the
-        # same peaks. Comparing sizes AFTER slicing amp (as this used to)
-        # compares a filtered length to an unfiltered one -- true only when
-        # nothing was dropped, so the "else" branch silently paired kept
-        # peaks with the first k rise/recovery times of the WRONG peaks
-        # every time keep dropped anything at all.
         amp = amp_raw[keep]
         rise = rise_raw[keep] if rise_raw.size == amp_raw.size else np.full(keep.sum(), np.nan)
         rec = rec_raw[keep] if rec_raw.size == amp_raw.size else np.full(keep.sum(), np.nan)
-        # Recovery time is frequently NaN when the window truncates the tail;
-        # duration falls back to rise time alone in that case.
+
+        # Recovery is often NaN when the window truncates the tail; duration
+        # falls back to rise time alone there.
         dur = np.where(np.isfinite(rec), rise + rec, rise)
         return amp, rise, dur
     except Exception as e:  # noqa: BLE001
         if STATS["scr_error"] is None:
             STATS["scr_error"] = f"{type(e).__name__}: {e}"
         STATS["scr_fallback"] += 1
-        # Fallback: simple prominence-based peak count on the phasic driver.
-        pk, props = sps.find_peaks(
-            phasic, prominence=SCR_MIN_AMP_US, width=1
-        )
+        pk, props = sps.find_peaks(phasic, prominence=SCR_MIN_AMP_US, width=1)
         amp = np.asarray(props.get("prominences", []), dtype=np.float64)
         widths = np.asarray(props.get("widths", []), dtype=np.float64) / fs
         return amp, widths * 0.5, widths
@@ -344,7 +242,7 @@ def _find_scrs(phasic: np.ndarray, fs: float):
 def eda_features(eda: np.ndarray, fs: float = EDA_FS) -> dict:
     """Ten EDA features over one 60 s window. Input in microsiemens."""
     eda = np.asarray(eda, dtype=np.float64).reshape(-1)
-    if eda.size < int(fs * 5):  # under 5 s of data is not usable
+    if eda.size < int(fs * 5):  # under 5 s is not usable
         return _nan_block(EDA_FEATURES)
 
     tonic, phasic, used_cvxeda = _decompose_eda(eda, fs)
@@ -352,12 +250,9 @@ def eda_features(eda: np.ndarray, fs: float = EDA_FS) -> dict:
     STATS["cvxeda_ok" if used_cvxeda else "cvxeda_fallback"] += 1
     amp, rise, dur = _find_scrs(phasic, fs)
 
-    # NeuroKit2 returns NaN rise/recovery times for SCRs whose onset falls
-    # before the window opens. Filtering to finite values first avoids a
-    # "Mean of empty slice" warning AND, more importantly, stops the feature
-    # silently becoming NaN when every SCR in the window is truncated.
-    # Zero is the correct fallback: "no measurable rise time in this window"
-    # is nearer zero than missing, and it keeps the column dense.
+    # NeuroKit2 returns NaN rise/recovery for SCRs whose onset precedes the
+    # window. Filtering to finite values keeps the column dense; zero is the
+    # right fallback, since "no measurable rise here" is nearer 0 than missing.
     amp_ok = amp[np.isfinite(amp)]
     rise_ok = rise[np.isfinite(rise)]
     dur_ok = dur[np.isfinite(dur)]
@@ -384,11 +279,11 @@ def eda_features(eda: np.ndarray, fs: float = EDA_FS) -> dict:
 def hr_features(hr: np.ndarray, fs: float, baseline_hr: float | None = None) -> dict:
     """Statistics on the computed HR stream over one short window.
 
-    `hr`  : sequence of HR values in bpm, already at the device's update rate.
-    `fs`  : that update rate in Hz (WESAD side must be resampled to match).
-    `baseline_hr` : rolling personal resting HR; None yields NaN for the delta.
+    hr           : HR values in bpm, already at the device's update rate.
+    fs           : that update rate in Hz (WESAD side is resampled to match).
+    baseline_hr  : personal resting HR; None yields NaN for the delta.
 
-    Deliberately contains no HRV. See module docstring.
+    Contains no HRV, by design. See module docstring.
     """
     hr = np.asarray(hr, dtype=np.float64).reshape(-1)
     valid = np.isfinite(hr) & (hr > 20.0) & (hr < 220.0)  # drop implausible
@@ -405,9 +300,7 @@ def hr_features(hr: np.ndarray, fs: float, baseline_hr: float | None = None) -> 
         "hr_max": float(np.max(hr)),
         "hr_range": float(np.ptp(hr)),
         "hr_slope": _slope(hr, fs, t=t),
-        "hr_baseline_delta": (
-            mean - float(baseline_hr) if baseline_hr is not None else np.nan
-        ),
+        "hr_baseline_delta": mean - float(baseline_hr) if baseline_hr is not None else np.nan,
     }
 
 
@@ -434,9 +327,9 @@ def imu_features(acc: np.ndarray, fs: float = ACC_FS) -> dict:
     out["acc_mag_sd"] = float(np.std(mag))
     out["acc_mag_absint"] = _abs_integral(mag - np.mean(mag), fs)
 
-    # Motion gate. In a single short window the flag is binary and the
-    # fraction is its float form; when short windows are aggregated into a
-    # 60 s vector, motion_fraction becomes the share of flagged sub-windows.
+    # In one short window the flag is binary and the fraction is its float
+    # form. Once short windows are aggregated into a 60 s vector,
+    # motion_fraction becomes the share of flagged sub-windows.
     flag = 1.0 if out["acc_mag_sd"] > MOTION_STD_THRESHOLD_G else 0.0
     out["motion_flag"] = flag
     out["motion_fraction"] = flag
@@ -444,16 +337,15 @@ def imu_features(acc: np.ndarray, fs: float = ACC_FS) -> dict:
 
 
 # --------------------------------------------------------------------------
-# Short-window aggregation
+# Assembly
 # --------------------------------------------------------------------------
 
 
 def aggregate_short_windows(blocks: list[dict], names: list[str]) -> dict:
-    """Collapse buffered short-window feature dicts into one 60 s summary.
+    """Collapse buffered short-window dicts into one 60 s summary.
 
-    Applied at each EDA-window close to the HR and IMU blocks. The rule per
-    feature is chosen to preserve its meaning: extremes take extremes, counts
-    and flags take means, everything else takes the mean.
+    The rule per feature preserves its meaning: extremes take extremes,
+    everything else takes the mean.
     """
     if not blocks:
         return _nan_block(names)
@@ -471,21 +363,14 @@ def aggregate_short_windows(blocks: list[dict], names: list[str]) -> dict:
             out[k] = float(np.nanmean(vals))
 
     # motion_fraction is the share of flagged sub-windows, not their mean
-    # magnitude — recompute it explicitly so the semantics are unambiguous.
+    # magnitude — recompute explicitly so the semantics are unambiguous.
     if "motion_flag" in names:
-        flags = np.array(
-            [b.get("motion_flag", np.nan) for b in blocks], dtype=np.float64
-        )
+        flags = np.array([b.get("motion_flag", np.nan) for b in blocks], dtype=np.float64)
         if not np.all(np.isnan(flags)):
             frac = float(np.nanmean(flags))
             out["motion_fraction"] = frac
             out["motion_flag"] = 1.0 if frac > 0.5 else 0.0
     return out
-
-
-# --------------------------------------------------------------------------
-# Assembly
-# --------------------------------------------------------------------------
 
 
 def cross_features(merged: dict) -> dict:
@@ -508,16 +393,9 @@ def feature_vector(
 ) -> dict:
     """Assemble one complete feature row at an EDA-window close.
 
-    `hr_short_blocks` / `imu_short_blocks` are the buffered outputs of
-    hr_features() / imu_features() over the short windows falling inside this
-    60 s window. Baseline HR is applied inside hr_features() at buffer time,
-    not here.
-
-    NOTE ON THE SIGNATURE: the `temp_win`, `baseline_temp` and `temp_fs`
-    parameters were removed at the 36-feature revision. They are NOT accepted
-    and silently ignored — a caller still passing them raises TypeError, which
-    is the intended behaviour. Any caller written against the 42-feature
-    contract must be updated, not coerced into working.
+    hr_short_blocks / imu_short_blocks are the buffered outputs of
+    hr_features() / imu_features() over the short windows inside this 60 s
+    window. Baseline HR is applied inside hr_features() at buffer time.
 
     Returns a dict whose keys are exactly FEATURE_NAMES, in that order.
     """
@@ -531,19 +409,13 @@ def feature_vector(
     extra = set(row) - set(FEATURE_NAMES)
     if missing or extra:
         raise RuntimeError(
-            f"feature contract violated — missing={sorted(missing)} "
-            f"extra={sorted(extra)}"
+            f"feature contract violated — missing={sorted(missing)} extra={sorted(extra)}"
         )
     return {k: row[k] for k in FEATURE_NAMES}
 
 
-def to_array(row: dict) -> np.ndarray:
-    """Ordered numeric array for the model. Order is FEATURE_NAMES, always."""
-    return np.array([row[k] for k in FEATURE_NAMES], dtype=np.float64)
-
-
 # --------------------------------------------------------------------------
-# WESAD-side adapter — training only, NOT part of the shared contract.
+# WESAD-side adapter — training only, not part of the shared contract.
 # --------------------------------------------------------------------------
 
 
@@ -556,20 +428,18 @@ class HRSeries:
 def bvp_to_hr(bvp: np.ndarray, fs: float = 64.0, out_fs: float = 1.0) -> HRSeries:
     """Derive an HR series from WESAD's raw BVP, emulating the SEN0344 output.
 
-    This exists ONLY on the training side. WESAD provides a 64 Hz BVP
-    waveform; the target hardware provides a computed HR number at a low
-    update rate. Training on the waveform and inferring on the number would
-    not transfer, so the waveform is reduced to a number here first.
+    Training side only. WESAD gives a 64 Hz BVP waveform; the hardware gives a
+    computed HR number at a low update rate. Training on the waveform and
+    inferring on the number would not transfer, so the waveform is reduced to
+    a number here first.
 
-    `out_fs` is the emulated HR update rate and is PROVISIONAL at 1 Hz. It
-    must be set to the SEN0344's measured cadence once the board is on the
-    bench, and the WESAD feature table rebuilt.
+    `out_fs` is the emulated update rate, PROVISIONAL at 1 Hz. Set it to the
+    SEN0344's measured cadence once the board is on the bench, then rebuild.
 
-    Note for the report: this is a genuine domain-gap contributor. NeuroKit2's
-    beat detector and DFRobot's undocumented on-board estimator are different
-    algorithms with different latency and different motion rejection, so
-    "mean HR" is the same quantity but not the same measurement either side
-    of the pipeline. State it rather than let it be found.
+    For the report: this is a real domain-gap contributor. NeuroKit2's beat
+    detector and DFRobot's undocumented on-board estimator are different
+    algorithms with different latency and motion rejection, so "mean HR" is
+    the same quantity but not the same measurement on both sides.
     """
     import neurokit2 as nk
 
@@ -577,9 +447,8 @@ def bvp_to_hr(bvp: np.ndarray, fs: float = 64.0, out_fs: float = 1.0) -> HRSerie
     sig, info = nk.ppg_process(bvp, sampling_rate=fs)
     inst = sig["PPG_Rate"].to_numpy()
 
-    # Decimate the per-sample instantaneous rate to the emulated update rate
-    # by averaging within each output interval — closer to what an on-board
-    # estimator reports than naive subsampling would be.
+    # Average the per-sample instantaneous rate within each output interval —
+    # closer to an on-board estimator than naive subsampling.
     step = int(round(fs / out_fs))
     n_out = inst.size // step
     if n_out == 0:
@@ -588,78 +457,7 @@ def bvp_to_hr(bvp: np.ndarray, fs: float = 64.0, out_fs: float = 1.0) -> HRSerie
     return HRSeries(np.nanmean(trimmed, axis=1), out_fs)
 
 
-# --------------------------------------------------------------------------
-# Device thermal telemetry — NOT part of the feature contract.
-# --------------------------------------------------------------------------
-#
-# Everything below this line describes the DEVICE, not the wearer. The LM75BD
-# is mounted on the PCB alongside the ESP32 and the regulators and reads board
-# temperature dominated by self-heating. It is instrumentation for power
-# dissipation and thermal behaviour under load — a hardware measurement that
-# belongs in the hardware chapter.
-#
-# Nothing here may be added to FEATURE_NAMES or passed to a model. If a
-# thermal channel is ever wanted as a physiological input, it needs a skin-
-# mounted sensor thermally isolated from the board, and a retrain — not a
-# re-import of these functions.
-
-TELEMETRY_TEMP_FIELDS = [
-    "dev_temp_mean",
-    "dev_temp_min",
-    "dev_temp_max",
-    "dev_temp_range",
-    "dev_temp_slope",
-    "dev_temp_rise_from_cold",
-]
-
-
-def temp_features(
-    temp: np.ndarray,
-    fs: float = TEMP_FS,
-    cold_start_temp: float | None = None,
-) -> dict:
-    """Device thermal telemetry from the on-board LM75BD.
-
-    `temp` : LM75BD readings in degrees C over the logging window.
-    `fs`   : LM75BD sample rate in Hz.
-    `cold_start_temp` : board temperature at power-on, before self-heating.
-        Supplying it gives the rise-from-cold figure, which is the number
-        that actually characterises dissipation. None yields NaN.
-
-    Returned keys are prefixed dev_ and are deliberately NOT the old temp_*
-    names, so telemetry can never be mistaken for a model feature by a merge
-    or a column-name match.
-
-    Interpretation: dev_temp_slope during a sustained WebSocket streaming load
-    is the useful measurement — it shows whether the board reaches thermal
-    equilibrium or continues to climb. dev_temp_rise_from_cold at steady state
-    is the headline dissipation figure for the report.
-    """
-    temp = np.asarray(temp, dtype=np.float64).reshape(-1)
-    valid = np.isfinite(temp)
-    t = np.arange(temp.size, dtype=np.float64) / fs
-    t, temp = t[valid], temp[valid]
-    if temp.size == 0:
-        return {k: np.nan for k in TELEMETRY_TEMP_FIELDS}
-
-    mean = float(np.mean(temp))
-    return {
-        "dev_temp_mean": mean,
-        "dev_temp_min": float(np.min(temp)),
-        "dev_temp_max": float(np.max(temp)),
-        "dev_temp_range": float(np.ptp(temp)),
-        "dev_temp_slope": _slope(temp, fs, t=t),
-        "dev_temp_rise_from_cold": (
-            float(np.max(temp)) - float(cold_start_temp)
-            if cold_start_temp is not None
-            else np.nan
-        ),
-    }
-
-
 if __name__ == "__main__":
     print(f"{N_FEATURES} features")
     for i, n in enumerate(FEATURE_NAMES):
         print(f"{i:3d}  {n}")
-    print(f"\nretired at the 36-feature revision: {', '.join(RETIRED_FEATURES)}")
-    print(f"telemetry (not features): {', '.join(TELEMETRY_TEMP_FIELDS)}")
