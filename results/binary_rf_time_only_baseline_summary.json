@@ -14,5 +14,6 @@
   "pooled_macro_f1": 0.9483136881970686,
   "worst_fold_macro_f1": 0.849459347389238,
   "best_fold_macro_f1": 1.0,
-  "standardise": "baseline"
+  "standardise": "baseline",
+  "n_ref_windows": 100
 }

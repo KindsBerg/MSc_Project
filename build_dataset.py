@@ -14,6 +14,7 @@ dependency gating, cache invalidation) are in Project_ML_Notes.
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import time
 from pathlib import Path
@@ -29,10 +30,29 @@ try:
 except Exception:  # noqa: BLE001
     WESAD_ROOT = None
 
-BASELINE_REF_S = 600.0  # resting reference taken from the opening of the recording
+BASELINE_REF_S = 300.0  # resting reference taken from the opening of the recording
 CACHE_DIR = Path("cache")
 META_COLS = ["subject", "label", "label_name", "t_start"]
 EXPECTED_COLS = F.FEATURE_NAMES + META_COLS
+
+# hr_baseline_delta is referenced against the first `baseline_ref_s` seconds
+# of the recording at BUILD time, independent of N_REF_WINDOWS. A warm-up
+# analysis that doesn't know this number will silently understate the real
+# latency of any feature set touching the HR block, so it travels with the
+# cache rather than living only in argv.
+def _meta_path(cache_path: Path) -> Path:
+    return cache_path.with_suffix(".meta.json")
+
+
+def _write_meta(cache_path: Path, baseline_ref_s: float) -> None:
+    meta = {
+        "baseline_ref_s": baseline_ref_s,
+        "win_eda_s": F.WIN_EDA_S,
+        "win_step_s": F.WIN_STEP_S,
+        "win_short_s": F.WIN_SHORT_S,
+        "n_features": F.N_FEATURES,
+    }
+    _meta_path(cache_path).write_text(json.dumps(meta, indent=2))
 
 
 def preflight() -> bool:
@@ -80,14 +100,17 @@ def _reject_reason(sub, t0: float, t1: float) -> str:
     return "impure" if counts.max() / seg.size < F.WINDOW_PURITY else "out_of_scope"
 
 
-def _baseline_hr(hr: np.ndarray, fs: float) -> float | None:
-    ref = _slice(hr, fs, 0.0, BASELINE_REF_S)
+def _baseline_hr(hr: np.ndarray, fs: float, ref_s: float = BASELINE_REF_S) -> float | None:
+    ref = _slice(hr, fs, 0.0, ref_s)
     ref = ref[np.isfinite(ref) & (ref > 20.0) & (ref < 220.0)]
     return float(np.mean(ref)) if ref.size else None
 
 
-def build_subject(sid: str, root: str, limit: int | None = None) -> pd.DataFrame:
+def build_subject(
+    sid: str, root: str, limit: int | None = None, baseline_ref_s: float = BASELINE_REF_S
+) -> pd.DataFrame:
     t_start = time.time()
+    stats_before = dict(F.STATS)  # per-subject delta, so a single bad subject doesn't hide in a run-wide aggregate
     sub = load_subject(sid, root)
 
     # BVP -> HR once for the whole recording, not per window: it is the
@@ -95,7 +118,7 @@ def build_subject(sid: str, root: str, limit: int | None = None) -> pd.DataFrame
     hr_series = F.bvp_to_hr(sub.bvp, fs=WRIST_FS["bvp"], out_fs=1.0)
     hr, hr_fs = hr_series.values, hr_series.fs
 
-    base_hr = _baseline_hr(hr, hr_fs)
+    base_hr = _baseline_hr(hr, hr_fs, ref_s=baseline_ref_s)
     if base_hr is None:
         print(f"  {sid}: WARNING — no resting HR reference; delta features NaN")
 
@@ -147,11 +170,22 @@ def build_subject(sid: str, root: str, limit: int | None = None) -> pd.DataFrame
 
     df = pd.DataFrame(rows, columns=EXPECTED_COLS)
     counts = df["label_name"].value_counts().to_dict() if len(df) else {}
+
+    # Per-subject delta, not the run-wide F.STATS total: an aggregate over
+    # every subject in the run can hide one subject whose cvxEDA never
+    # converges, and it silently omits cache-hit subjects entirely.
+    eda_n = F.STATS["eda_windows"] - stats_before["eda_windows"]
+    cvx_fb = F.STATS["cvxeda_fallback"] - stats_before["cvxeda_fallback"]
+    scr_n = F.STATS["scr_windows"] - stats_before["scr_windows"]
+    scr_fb = F.STATS["scr_fallback"] - stats_before["scr_fallback"]
+    motion_rate = float(df["motion_flag"].mean()) if len(df) and "motion_flag" in df else float("nan")
+
     print(
         f"  {sid}: {len(df):>5} kept "
         f"({' '.join(f'{k[:4]}={v}' for k, v in sorted(counts.items()))})  "
         f"| scope={drops['out_of_scope']} boundary={drops['impure']} "
-        f"no_hr={drops['no_hr']}  {time.time() - t_start:.0f}s"
+        f"no_hr={drops['no_hr']}  cvxEDA_fb={cvx_fb}/{eda_n} scr_fb={scr_fb}/{scr_n} "
+        f"motion={motion_rate:.1%}  {time.time() - t_start:.0f}s"
     )
     return df
 
@@ -190,7 +224,7 @@ def _read(path: Path) -> pd.DataFrame:
     return df
 
 
-def quality_report(df: pd.DataFrame) -> int:
+def quality_report(df: pd.DataFrame, n_rebuilt: int = -1) -> int:
     """All-NaN or constant columns get imputed away silently. Surface them."""
     problems = 0
     print("\nFEATURE QUALITY")
@@ -207,7 +241,22 @@ def quality_report(df: pd.DataFrame) -> int:
     if not problems:
         print("  no all-NaN or constant columns")
 
+    if "motion_flag" in df.columns:
+        print("\n  motion flag rate by subject (share of windows over the ACC gate):")
+        rates = df.groupby("subject")["motion_flag"].mean().sort_values()
+        for sid, rate in rates.items():
+            flag = "  <-- always/never flagged, check the threshold" if rate in (0.0, 1.0) else ""
+            print(f"    {sid:<5} {rate:.1%}{flag}")
+        if rates.eq(0.0).any() or rates.eq(1.0).any():
+            problems += 1
+
     st = F.STATS
+    n_subjects = df["subject"].nunique()
+    if 0 <= n_rebuilt < n_subjects:
+        print(
+            f"\n  NOTE: cvxEDA/SCR stats below reflect {n_rebuilt}/{n_subjects} subjects "
+            "rebuilt this run -- cache hits contribute 0 and are invisible to this total"
+        )
     if st["eda_windows"]:
         rate = st["cvxeda_fallback"] / st["eda_windows"]
         print(
@@ -232,6 +281,12 @@ def main() -> int:
     ap.add_argument("--check", action="store_true")
     ap.add_argument("--skip-preflight", action="store_true")
     ap.add_argument("--outdir", default="cache")
+    ap.add_argument(
+        "--baseline-ref-s", type=float, default=BASELINE_REF_S,
+        help="resting-HR reference window in seconds, baked into hr_baseline_delta "
+             f"at build time (default {BASELINE_REF_S:.0f}s, the opening of the "
+             "WESAD protocol before any stressor)",
+    )
     args = ap.parse_args()
 
     global CACHE_DIR
@@ -250,10 +305,12 @@ def main() -> int:
     F.reset_stats()
     print(
         f"window={F.WIN_EDA_S:.0f}s step={F.WIN_STEP_S:.0f}s "
-        f"short={F.WIN_SHORT_S:.0f}s features={F.N_FEATURES}"
+        f"short={F.WIN_SHORT_S:.0f}s features={F.N_FEATURES} "
+        f"baseline_ref_s={args.baseline_ref_s:.0f}s"
     )
 
     built: list[Path] = []
+    n_rebuilt = 0
     for sid in args.subjects or SUBJECTS:
         cached = _existing(sid)
         if cached and not args.force:
@@ -261,12 +318,15 @@ def main() -> int:
             built.append(cached)
             continue
         try:
-            df = build_subject(sid, args.root, limit=args.limit)
+            df = build_subject(sid, args.root, limit=args.limit, baseline_ref_s=args.baseline_ref_s)
         except Exception as e:  # noqa: BLE001
             print(f"  {sid}: FAILED — {type(e).__name__}: {e}")
             continue
         if not df.empty:
-            built.append(_write(df, _cache_path(sid)))
+            path = _write(df, _cache_path(sid))
+            _write_meta(path, args.baseline_ref_s)
+            built.append(path)
+            n_rebuilt += 1
 
     if not built:
         print("\nnothing built")
@@ -280,10 +340,12 @@ def main() -> int:
 
     print(f"\nTOTAL {len(all_df)} windows across {all_df['subject'].nunique()} subjects")
     print(all_df["label_name"].value_counts(normalize=True).round(3).to_string())
-    problems = quality_report(all_df)
+    problems = quality_report(all_df, n_rebuilt=n_rebuilt)
 
     if args.combine:
-        print(f"\ncombined -> {_write(all_df, CACHE_DIR / 'wesad_features.parquet')}")
+        combined_path = _write(all_df, CACHE_DIR / "wesad_features.parquet")
+        _write_meta(combined_path, args.baseline_ref_s)
+        print(f"\ncombined -> {combined_path}")
     return 1 if problems else 0
 
 

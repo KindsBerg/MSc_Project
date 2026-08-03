@@ -215,13 +215,23 @@ def assert_no_retired(names) -> None:
 # --------------------------------------------------------------------------
 
 
-def _slope(x: np.ndarray, fs: float) -> float:
-    """Least-squares slope in units per second. NaN if under two samples."""
+def _slope(x: np.ndarray, fs: float, t: np.ndarray | None = None) -> float:
+    """Least-squares slope in units per second. NaN if under two samples.
+
+    Pass `t` (seconds) explicitly whenever `x` has already had samples
+    dropped by a validity filter upstream. Reconstructing a contiguous
+    `arange(n)/fs` axis from a filtered array silently compresses whatever
+    gap the dropped samples left, biasing the slope on every window that
+    drops so much as one sample.
+    """
     x = np.asarray(x, dtype=np.float64)
     n = x.size
     if n < 2:
         return np.nan
-    t = np.arange(n, dtype=np.float64) / fs
+    if t is None:
+        t = np.arange(n, dtype=np.float64) / fs
+    else:
+        t = np.asarray(t, dtype=np.float64)
     return float(np.polyfit(t, x, 1)[0])
 
 
@@ -300,13 +310,20 @@ def _find_scrs(phasic: np.ndarray, fs: float):
         import neurokit2 as nk
 
         _, info = nk.eda_peaks(phasic, sampling_rate=fs, method="neurokit")
-        amp = np.asarray(info.get("SCR_Amplitude", []), dtype=np.float64)
-        rise = np.asarray(info.get("SCR_RiseTime", []), dtype=np.float64)
-        rec = np.asarray(info.get("SCR_RecoveryTime", []), dtype=np.float64)
-        keep = np.isfinite(amp) & (amp >= SCR_MIN_AMP_US)
-        amp = amp[keep]
-        rise = rise[keep] if rise.size == amp.size else rise[: amp.size]
-        rec = rec[keep] if rec.size == amp.size else rec[: amp.size]
+        amp_raw = np.asarray(info.get("SCR_Amplitude", []), dtype=np.float64)
+        rise_raw = np.asarray(info.get("SCR_RiseTime", []), dtype=np.float64)
+        rec_raw = np.asarray(info.get("SCR_RecoveryTime", []), dtype=np.float64)
+        keep = np.isfinite(amp_raw) & (amp_raw >= SCR_MIN_AMP_US)
+        # `keep` is built against the RAW (pre-filter) arrays and applied to
+        # all three identically, so amp/rise/rec stay index-aligned to the
+        # same peaks. Comparing sizes AFTER slicing amp (as this used to)
+        # compares a filtered length to an unfiltered one -- true only when
+        # nothing was dropped, so the "else" branch silently paired kept
+        # peaks with the first k rise/recovery times of the WRONG peaks
+        # every time keep dropped anything at all.
+        amp = amp_raw[keep]
+        rise = rise_raw[keep] if rise_raw.size == amp_raw.size else np.full(keep.sum(), np.nan)
+        rec = rec_raw[keep] if rec_raw.size == amp_raw.size else np.full(keep.sum(), np.nan)
         # Recovery time is frequently NaN when the window truncates the tail;
         # duration falls back to rise time alone in that case.
         dur = np.where(np.isfinite(rec), rise + rec, rise)
@@ -374,7 +391,9 @@ def hr_features(hr: np.ndarray, fs: float, baseline_hr: float | None = None) -> 
     Deliberately contains no HRV. See module docstring.
     """
     hr = np.asarray(hr, dtype=np.float64).reshape(-1)
-    hr = hr[np.isfinite(hr) & (hr > 20.0) & (hr < 220.0)]  # drop implausible
+    valid = np.isfinite(hr) & (hr > 20.0) & (hr < 220.0)  # drop implausible
+    t = np.arange(hr.size, dtype=np.float64) / fs
+    t, hr = t[valid], hr[valid]
     if hr.size == 0:
         return _nan_block(HR_FEATURES)
 
@@ -385,7 +404,7 @@ def hr_features(hr: np.ndarray, fs: float, baseline_hr: float | None = None) -> 
         "hr_min": float(np.min(hr)),
         "hr_max": float(np.max(hr)),
         "hr_range": float(np.ptp(hr)),
-        "hr_slope": _slope(hr, fs),
+        "hr_slope": _slope(hr, fs, t=t),
         "hr_baseline_delta": (
             mean - float(baseline_hr) if baseline_hr is not None else np.nan
         ),
@@ -617,7 +636,9 @@ def temp_features(
     is the headline dissipation figure for the report.
     """
     temp = np.asarray(temp, dtype=np.float64).reshape(-1)
-    temp = temp[np.isfinite(temp)]
+    valid = np.isfinite(temp)
+    t = np.arange(temp.size, dtype=np.float64) / fs
+    t, temp = t[valid], temp[valid]
     if temp.size == 0:
         return {k: np.nan for k in TELEMETRY_TEMP_FIELDS}
 
@@ -627,7 +648,7 @@ def temp_features(
         "dev_temp_min": float(np.min(temp)),
         "dev_temp_max": float(np.max(temp)),
         "dev_temp_range": float(np.ptp(temp)),
-        "dev_temp_slope": _slope(temp, fs),
+        "dev_temp_slope": _slope(temp, fs, t=t),
         "dev_temp_rise_from_cold": (
             float(np.max(temp)) - float(cold_start_temp)
             if cold_start_temp is not None
