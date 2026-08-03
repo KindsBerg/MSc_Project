@@ -25,11 +25,42 @@ Design constraints inherited from the sensor set (see WESAD_NOTES §2.2)
   intersection of the two, not the union, so gyro is excluded here. It may
   still be logged and used for live signal-quality gating outside the model.
 * NO SpO2. Same data-access reason as HRV.
+* NO TEMPERATURE. This is the newest exclusion and the reasoning differs
+  from the three above, so it is set out in full below.
+
+--------------------------------------------------------------------------
+Why temperature is not a feature (added at the 36-feature revision)
+--------------------------------------------------------------------------
+WESAD's TEMP channel is an isolated skin thermistor on an Empatica E4. The
+LM75BD on this project's PCB is not that instrument and was never mounted to
+be. It sits on the board, thermally coupled to the ESP32 and the regulators,
+and reads device temperature — its role in this build is thermal monitoring
+of power dissipation, not physiological sensing.
+
+Training a physiological feature on a skin thermistor and inferring it from a
+board sensor is a train/serve mismatch of kind, not of degree. Two supporting
+measurements from the ablation sweep (results/ablation_sweep.csv, retained
+in the repository as the evidence for this decision):
+
+  * Removing the whole TEMP block cost -0.004 binary balanced accuracy,
+    inside the +/-0.127 per-fold spread. On the headline task the block was
+    not carrying the result.
+  * Absolute temperature features correlated with elapsed session time at
+    |r| ~ 0.65 (results/time_confound.csv). Part of what they contributed
+    under LOSO was session position, which does not exist in live use.
+
+The block cost -0.057 on 3-class, where it helped separate amusement from
+baseline. That loss is accepted: 3-class is the secondary result and
+amusement is the acknowledged weak class.
+
+temp_features() is retained at the bottom of this file, OUTSIDE the feature
+contract, for device thermal telemetry. It is not called by feature_vector()
+and its output must never enter the model.
 
 --------------------------------------------------------------------------
 Window scheme
 --------------------------------------------------------------------------
-EDA/TEMP  60 s  — matches WESAD's own 60 s physiological window exactly.
+EDA       60 s — matches WESAD's own 60 s physiological window exactly.
 HR/IMU    WIN_SHORT_S — shorter, per the multi-rate architecture. WESAD HR
           features MUST be recomputed on this same short window during
           training, or "mean HR" means two different things either side of
@@ -54,14 +85,18 @@ from scipy import signal as sps
 # Window and threshold configuration — change here, nowhere else.
 # --------------------------------------------------------------------------
 
-WIN_EDA_S = 60.0  # EDA/TEMP window, matches WESAD
+WIN_EDA_S = 60.0  # EDA window, matches WESAD
 WIN_SHORT_S = 15.0  # HR/IMU window — PROVISIONAL, see module docstring
 WIN_STEP_S = 5.0  # slide between consecutive EDA windows
 WINDOW_PURITY = 0.9  # min fraction of agreeing labels for a valid window
 
 EDA_FS = 4.0  # Hz, WESAD wrist EDA and target for the live AFE
-TEMP_FS = 4.0  # Hz
 ACC_FS = 32.0  # Hz, E4; MPU6050 configured to match
+
+# LM75BD sample rate. Device telemetry only — not a model input. Retained
+# here so the telemetry helper has a default and so the constant lives with
+# the other rates rather than drifting into firmware-side code.
+TEMP_FS = 4.0  # Hz
 
 # SCR detection: amplitude below this is treated as noise, not a response.
 SCR_MIN_AMP_US = 0.01
@@ -130,7 +165,22 @@ IMU_FEATURES = [
     "motion_fraction",
 ]
 
-TEMP_FEATURES = [
+CROSS_FEATURES = [
+    "hr_delta_x_still",   # hr_baseline_delta * (1 - motion_fraction)
+    "eda_range_gated",    # eda_range * (1 - motion_fraction)
+]
+
+FEATURE_NAMES: list[str] = (
+    EDA_FEATURES + HR_FEATURES + IMU_FEATURES + CROSS_FEATURES
+)
+
+N_FEATURES = len(FEATURE_NAMES)
+
+# Names that were in the contract before the 36-feature revision and must
+# never silently reappear. Anything downstream that still references these
+# (a stale feature-set definition, an old cached parquet, a joblib exported
+# from the 42-feature contract) should fail loudly rather than be tolerated.
+RETIRED_FEATURES: list[str] = [
     "temp_mean",
     "temp_min",
     "temp_max",
@@ -139,16 +189,25 @@ TEMP_FEATURES = [
     "temp_baseline_delta",
 ]
 
-CROSS_FEATURES = [
-    "hr_delta_x_still",   # hr_baseline_delta * (1 - motion_fraction)
-    "eda_range_gated",    # eda_range * (1 - motion_fraction)
-]
+assert not (set(FEATURE_NAMES) & set(RETIRED_FEATURES))
+assert len(set(FEATURE_NAMES)) == N_FEATURES, "duplicate name in FEATURE_NAMES"
 
-FEATURE_NAMES: list[str] = (
-    EDA_FEATURES + HR_FEATURES + IMU_FEATURES + TEMP_FEATURES + CROSS_FEATURES
-)
 
-N_FEATURES = len(FEATURE_NAMES)
+def assert_no_retired(names) -> None:
+    """Raise if any retired feature name appears in `names`.
+
+    Call this wherever a feature list arrives from outside this module — a
+    loaded model artefact, a cached table's columns, a CLI feature-set
+    argument. A stale 42-column input silently accepted by a 36-column model
+    is exactly the failure mode the feature contract exists to prevent.
+    """
+    stale = sorted(set(names) & set(RETIRED_FEATURES))
+    if stale:
+        raise RuntimeError(
+            f"retired feature(s) present: {stale}. These were removed at the "
+            "36-feature revision; the source is from the old contract and "
+            "must be rebuilt, not coerced."
+        )
 
 
 # --------------------------------------------------------------------------
@@ -366,40 +425,6 @@ def imu_features(acc: np.ndarray, fs: float = ACC_FS) -> dict:
 
 
 # --------------------------------------------------------------------------
-# TEMP block — slow context, attached to the 60 s window
-# --------------------------------------------------------------------------
-
-
-def temp_features(
-    temp: np.ndarray, fs: float = TEMP_FS, baseline_temp: float | None = None
-) -> dict:
-    """Skin-temperature features.
-
-    Only slope and baseline-delta are strongly trustworthy on the target
-    hardware: the LM75BD sits on the PCB and reads a mixture of skin
-    temperature and board self-heating from the ESP32 and regulators. The
-    absolute mean is retained because WESAD has it, but should be expected
-    to carry an offset at inference and to be down-weighted accordingly.
-    """
-    temp = np.asarray(temp, dtype=np.float64).reshape(-1)
-    temp = temp[np.isfinite(temp)]
-    if temp.size == 0:
-        return _nan_block(TEMP_FEATURES)
-
-    mean = float(np.mean(temp))
-    return {
-        "temp_mean": mean,
-        "temp_min": float(np.min(temp)),
-        "temp_max": float(np.max(temp)),
-        "temp_range": float(np.ptp(temp)),
-        "temp_slope": _slope(temp, fs),
-        "temp_baseline_delta": (
-            mean - float(baseline_temp) if baseline_temp is not None else np.nan
-        ),
-    }
-
-
-# --------------------------------------------------------------------------
 # Short-window aggregation
 # --------------------------------------------------------------------------
 
@@ -458,12 +483,9 @@ def cross_features(merged: dict) -> dict:
 
 def feature_vector(
     eda_win: np.ndarray,
-    temp_win: np.ndarray,
     hr_short_blocks: list[dict],
     imu_short_blocks: list[dict],
-    baseline_temp: float | None = None,
     eda_fs: float = EDA_FS,
-    temp_fs: float = TEMP_FS,
 ) -> dict:
     """Assemble one complete feature row at an EDA-window close.
 
@@ -472,13 +494,18 @@ def feature_vector(
     60 s window. Baseline HR is applied inside hr_features() at buffer time,
     not here.
 
+    NOTE ON THE SIGNATURE: the `temp_win`, `baseline_temp` and `temp_fs`
+    parameters were removed at the 36-feature revision. They are NOT accepted
+    and silently ignored — a caller still passing them raises TypeError, which
+    is the intended behaviour. Any caller written against the 42-feature
+    contract must be updated, not coerced into working.
+
     Returns a dict whose keys are exactly FEATURE_NAMES, in that order.
     """
     row: dict = {}
     row.update(eda_features(eda_win, eda_fs))
     row.update(aggregate_short_windows(hr_short_blocks, HR_FEATURES))
     row.update(aggregate_short_windows(imu_short_blocks, IMU_FEATURES))
-    row.update(temp_features(temp_win, temp_fs, baseline_temp))
     row.update(cross_features(row))
 
     missing = set(FEATURE_NAMES) - set(row)
@@ -542,7 +569,76 @@ def bvp_to_hr(bvp: np.ndarray, fs: float = 64.0, out_fs: float = 1.0) -> HRSerie
     return HRSeries(np.nanmean(trimmed, axis=1), out_fs)
 
 
+# --------------------------------------------------------------------------
+# Device thermal telemetry — NOT part of the feature contract.
+# --------------------------------------------------------------------------
+#
+# Everything below this line describes the DEVICE, not the wearer. The LM75BD
+# is mounted on the PCB alongside the ESP32 and the regulators and reads board
+# temperature dominated by self-heating. It is instrumentation for power
+# dissipation and thermal behaviour under load — a hardware measurement that
+# belongs in the hardware chapter.
+#
+# Nothing here may be added to FEATURE_NAMES or passed to a model. If a
+# thermal channel is ever wanted as a physiological input, it needs a skin-
+# mounted sensor thermally isolated from the board, and a retrain — not a
+# re-import of these functions.
+
+TELEMETRY_TEMP_FIELDS = [
+    "dev_temp_mean",
+    "dev_temp_min",
+    "dev_temp_max",
+    "dev_temp_range",
+    "dev_temp_slope",
+    "dev_temp_rise_from_cold",
+]
+
+
+def temp_features(
+    temp: np.ndarray,
+    fs: float = TEMP_FS,
+    cold_start_temp: float | None = None,
+) -> dict:
+    """Device thermal telemetry from the on-board LM75BD.
+
+    `temp` : LM75BD readings in degrees C over the logging window.
+    `fs`   : LM75BD sample rate in Hz.
+    `cold_start_temp` : board temperature at power-on, before self-heating.
+        Supplying it gives the rise-from-cold figure, which is the number
+        that actually characterises dissipation. None yields NaN.
+
+    Returned keys are prefixed dev_ and are deliberately NOT the old temp_*
+    names, so telemetry can never be mistaken for a model feature by a merge
+    or a column-name match.
+
+    Interpretation: dev_temp_slope during a sustained WebSocket streaming load
+    is the useful measurement — it shows whether the board reaches thermal
+    equilibrium or continues to climb. dev_temp_rise_from_cold at steady state
+    is the headline dissipation figure for the report.
+    """
+    temp = np.asarray(temp, dtype=np.float64).reshape(-1)
+    temp = temp[np.isfinite(temp)]
+    if temp.size == 0:
+        return {k: np.nan for k in TELEMETRY_TEMP_FIELDS}
+
+    mean = float(np.mean(temp))
+    return {
+        "dev_temp_mean": mean,
+        "dev_temp_min": float(np.min(temp)),
+        "dev_temp_max": float(np.max(temp)),
+        "dev_temp_range": float(np.ptp(temp)),
+        "dev_temp_slope": _slope(temp, fs),
+        "dev_temp_rise_from_cold": (
+            float(np.max(temp)) - float(cold_start_temp)
+            if cold_start_temp is not None
+            else np.nan
+        ),
+    }
+
+
 if __name__ == "__main__":
     print(f"{N_FEATURES} features")
     for i, n in enumerate(FEATURE_NAMES):
         print(f"{i:3d}  {n}")
+    print(f"\nretired at the 36-feature revision: {', '.join(RETIRED_FEATURES)}")
+    print(f"telemetry (not features): {', '.join(TELEMETRY_TEMP_FIELDS)}")

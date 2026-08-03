@@ -3,6 +3,7 @@
   "model": "rf",
   "feature_set": "time_only",
   "n_features": 1,
+  "contract_n_features": 36,
   "n_folds": 15,
   "accuracy_mean": 0.9556743479443097,
   "accuracy_sd": 0.050628724858253316,

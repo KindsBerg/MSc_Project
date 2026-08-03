@@ -3,6 +3,7 @@
   "model": "rf",
   "feature_set": "eda_plus_time",
   "n_features": 11,
+  "contract_n_features": 36,
   "n_folds": 15,
   "accuracy_mean": 0.9493260639752635,
   "accuracy_sd": 0.05761082763237064,
