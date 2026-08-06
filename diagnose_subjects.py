@@ -28,7 +28,7 @@ import numpy as np
 import pandas as pd
 
 import features as F
-from train_model import N_REF_WINDOWS, TIME_COL, Z_CLIP, load_table, standardise
+from train_model import FEATURE_SETS, N_REF_WINDOWS, TIME_COL, Z_CLIP, load_table, standardise
 
 # Tonic and phasic are separated deliberately: a subject can be flat on one
 # and strong on the other, and that distinction matters physiologically.
@@ -142,6 +142,52 @@ def reference_check(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def zero_iqr_exposure(df: pd.DataFrame, feature_set: str) -> pd.DataFrame:
+    """Which columns of `feature_set` have zero IQR over each subject's first
+    N_REF_WINDOWS accepted windows — the compute_scale() condition that used
+    to route training and live inference to different fallback tiers before
+    the wider-block tier was removed (export_model.py). One row per subject.
+    """
+    cols = [c for c in FEATURE_SETS[feature_set] if c in df.columns]
+    rows = []
+    for sid, block in df.groupby("subject"):
+        ref = block.sort_values(TIME_COL).head(N_REF_WINDOWS)[cols]
+        iqr = ref.quantile(0.75) - ref.quantile(0.25)
+        zero_cols = iqr[iqr == 0].index.tolist()
+        rows.append(
+            {
+                "subject": sid,
+                "feature_set": feature_set,
+                "n_ref": len(ref),
+                "n_zero_iqr_cols": len(zero_cols),
+                "zero_iqr_cols": ";".join(zero_cols),
+            }
+        )
+    out = pd.DataFrame(rows).sort_values("n_zero_iqr_cols", ascending=False).reset_index(
+        drop=True
+    )
+
+    col_counts = pd.Series(0, index=cols, dtype=int)
+    for cs in out["zero_iqr_cols"]:
+        for c in filter(None, cs.split(";")):
+            col_counts[c] += 1
+    col_counts = col_counts[col_counts > 0].sort_values(ascending=False)
+
+    print("\n" + "=" * 76)
+    print(f"ZERO-IQR EXPOSURE — feature_set={feature_set!r}, n_ref={N_REF_WINDOWS}")
+    print("=" * 76)
+    print(f"{'subj':<6}{'n_zero_iqr_cols':>16}   columns")
+    for _, r in out.iterrows():
+        print(f"{r['subject']:<6}{r['n_zero_iqr_cols']:>16}   {r['zero_iqr_cols']}")
+    print(f"\nper-column count across {df['subject'].nunique()} subjects:")
+    if col_counts.empty:
+        print("  none — every column has nonzero reference IQR in every subject")
+    else:
+        for c, n in col_counts.items():
+            print(f"  {c:<24} {n}")
+    return out
+
+
 def magnitude_check(df: pd.DataFrame) -> pd.DataFrame:
     """Post-standardisation magnitudes per subject.
 
@@ -233,9 +279,26 @@ def main() -> int:
     ap.add_argument("--cache", default="cache")
     ap.add_argument("--subjects", nargs="*", default=["S14", "S3", "S2", "S17", "S11"])
     ap.add_argument("--out", default="results/subject_diagnostics.csv")
+    ap.add_argument(
+        "--zero-iqr", nargs="*", default=None, metavar="FEATURE_SET",
+        help="run zero_iqr_exposure() for these feature sets (e.g. clean eda_only) "
+             "instead of the responder/reference/magnitude report",
+    )
+    ap.add_argument("--zero-iqr-out", default="results/zero_iqr_exposure.csv")
     args = ap.parse_args()
 
     df = load_table(Path(args.cache))
+
+    if args.zero_iqr is not None:
+        merged = pd.concat(
+            [zero_iqr_exposure(df, fs) for fs in args.zero_iqr], ignore_index=True
+        )
+        out = Path(args.zero_iqr_out)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        merged.to_csv(out, index=False)
+        print(f"\nsaved -> {out}")
+        return 0
+
     resp = responder_check(df)
     ref = reference_check(df)
     mag = magnitude_check(df)

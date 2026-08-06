@@ -1,0 +1,17 @@
+{
+  "task": "3class",
+  "model": "rf",
+  "feature_set": "no_temp",
+  "n_features": 36,
+  "n_folds": 15,
+  "accuracy_mean": 0.8124436701759391,
+  "accuracy_sd": 0.09874595299006711,
+  "balanced_acc_mean": 0.6993875187131284,
+  "balanced_acc_sd": 0.13264510799399384,
+  "macro_f1_mean": 0.6858843528823135,
+  "macro_f1_sd": 0.1388994258688478,
+  "pooled_macro_f1": 0.7197517305871078,
+  "worst_fold_macro_f1": 0.41892536590309654,
+  "best_fold_macro_f1": 0.9467592592592592,
+  "standardise": "baseline"
+}

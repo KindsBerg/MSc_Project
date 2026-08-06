@@ -1,0 +1,19 @@
+{
+  "task": "3class",
+  "model": "rf",
+  "feature_set": "all",
+  "n_features": 36,
+  "contract_n_features": 36,
+  "n_folds": 15,
+  "accuracy_mean": 0.7841819518943627,
+  "accuracy_sd": 0.0870122788460561,
+  "balanced_acc_mean": 0.6475281172864737,
+  "balanced_acc_sd": 0.123009222631036,
+  "macro_f1_mean": 0.6284686368987052,
+  "macro_f1_sd": 0.1376366915265358,
+  "pooled_macro_f1": 0.6623230372586721,
+  "worst_fold_macro_f1": 0.34926745350198124,
+  "best_fold_macro_f1": 0.8515347576986937,
+  "standardise": "baseline",
+  "n_ref_windows": 40
+}

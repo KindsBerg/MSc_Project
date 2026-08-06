@@ -14,8 +14,9 @@ Exclusions, and why (see WESAD_NOTES §2.2):
               a computed HR number is available. The HR block is statistics on
               that number. hr_sd is the variability of the HR trend and must
               never be called HRV.
-  NO GYRO     The MPU6050 has one; the Empatica E4 that recorded WESAD does
-              not. Features come from the intersection of the two sensors.
+  NO GYRO     The LSM6DS3TR-C has one; the Empatica E4 that recorded WESAD
+              does not. Features come from the intersection of the two
+              sensors.
   NO SpO2     Same data-access reason as HRV.
   NO TEMP     WESAD's TEMP is a skin thermistor. The LM75BD on this PCB reads
               board temperature dominated by self-heating — a different
@@ -23,24 +24,28 @@ Exclusions, and why (see WESAD_NOTES §2.2):
               -0.004 binary balanced accuracy (inside the +/-0.127 fold
               spread), and its absolute features correlated with elapsed
               session time at |r| ~ 0.65. Device thermal telemetry is handled
-              on the ESP32 and never enters the model.
+              on the ESP32 and never enters the model. (Two more thermal
+              sources exist on the live path — SEN0344 register 0x14 and the
+              LSM6DS3TR-C die sensor — both diagnostics only, same reason.)
 
 Windows:
   EDA        60 s, matching WESAD's own physiological window.
-  HR / IMU   WIN_SHORT_S, per the multi-rate architecture. WESAD HR features
-             are recomputed on this same short window so "mean HR" means the
-             same thing either side of the pipeline.
+  HR         WIN_SHORT_HR_S = 40 s. Measured off the SEN0344 vendor library:
+             the sensor updates its computed HR once every 4 s, so a 40 s
+             window holds ~10 samples — enough for sd/slope to mean something.
+             A 15 s window at that cadence would hold 3-4.
+  IMU        WIN_SHORT_IMU_S = 15 s, unchanged. The accelerometer's native
+             rate is high regardless of PPG cadence, so it keeps the
+             finer-grained window.
 
-WIN_SHORT_S is PROVISIONAL at 15 s, pending measurement of the SEN0344's real
-HR update cadence on the bench. If it emits HR every 1-4 s, a 15 s window
-holds only 4-15 samples and sd/slope will be coarse. It is one constant so
-that rebuilding the feature table afterwards is cheap.
+Both were PROVISIONAL as one constant (WIN_SHORT_S) pending a bench
+measurement of the SEN0344's real HR update cadence; that measurement is now
+in and the constant has been split accordingly (see the vendor comment on
+bvp_to_hr's out_fs below).
 """
 
 from __future__ import annotations
-
 from dataclasses import dataclass
-
 import numpy as np
 from scipy import signal as sps
 
@@ -48,13 +53,14 @@ from scipy import signal as sps
 # Configuration — change here, nowhere else.
 # --------------------------------------------------------------------------
 
-WIN_EDA_S = 60.0     # EDA window, matches WESAD
-WIN_SHORT_S = 15.0   # HR/IMU window — PROVISIONAL, see docstring
-WIN_STEP_S = 5.0     # slide between consecutive EDA windows
-WINDOW_PURITY = 0.9  # min fraction of agreeing labels for a valid window
+WIN_EDA_S = 60.0          # EDA window, matches WESAD
+WIN_SHORT_HR_S = 40.0     # HR sub-window — ~10 samples at the SEN0344's 0.25 Hz cadence
+WIN_SHORT_IMU_S = 15.0    # IMU sub-window — unchanged, IMU rate is high either way
+WIN_STEP_S = 5.0          # slide between consecutive EDA windows
+WINDOW_PURITY = 0.9       # min fraction of agreeing labels for a valid window
 
 EDA_FS = 4.0   # Hz, WESAD wrist EDA and the target for the live AFE
-ACC_FS = 32.0  # Hz, E4; MPU6050 configured to match
+ACC_FS = 32.0  # Hz, E4; live LSM6DS3TR-C decimated down to match, see IMU_TARGET_FS_HZ
 
 # SCR amplitude below this is noise, not a response.
 SCR_MIN_AMP_US = 0.01
@@ -64,20 +70,37 @@ SCR_MIN_AMP_US = 0.01
 # worn recordings and report the value used.
 MOTION_STD_THRESHOLD_G = 0.05
 
+# LSM6DS3TR-C ingest: live samples arrive at the library's default 104 Hz ODR
+# and must be decimated to WESAD's 32 Hz before imu_features() sees them.
+IMU_TARGET_FS_HZ = 32.0
+# Configured range, matching the E4's own clipping behaviour (decision, not a
+# library default — the LSM6DS3TR-C defaults to +/-4 g).
+IMU_RANGE_G = 2.0
+# E4 quantisation step: 1/64 g, vs the LSM6DS3TR-C's 0.061 mg/LSB at +/-2 g —
+# roughly 250x coarser. See quantise_to_e4_grid() in live_host.py.
+E4_ACC_LSB_G = 1.0 / 64.0
+EMULATE_E4_QUANTISATION = True
+
+# SEN0344 computed-HR update cadence, measured off the vendor library (see
+# bvp_to_hr below). Named here so callers can reference it explicitly instead
+# of relying on bvp_to_hr's default.
+SEN0344_HR_FS_HZ = 0.25
+
 # Band for the accelerometer peak-frequency feature (human movement).
 ACC_BAND_HZ = (0.3, 10.0)
 
 # cvxEDA occasionally fails to converge on a short window and falls back to a
 # median-filter decomposition. The fallback rate belongs in the report, so it
 # is counted rather than lost. reset_stats() at the start of a batch run.
+#STATS purpose is to define a dictionary that holds stats about EDA processing.
 STATS = {
-    "eda_windows": 0,
-    "cvxeda_ok": 0,
-    "cvxeda_fallback": 0,
+    "eda_windows": 0, # number of EDA windows processed
+    "cvxeda_ok": 0, # cvxeda stands for convex optimization EDA. ok means they succeeded. convex optimiation is a method for decomposing EDA signals into tonic and phasic components.
+    "cvxeda_fallback": 0, # convex optimization eda num failed
     "cvxeda_error": None,   # first fallback reason only
-    "scr_windows": 0,
-    "scr_fallback": 0,
-    "scr_error": None,
+    "scr_windows": 0, # scr means skin conductance response, this holds the num of scr windows processed
+    "scr_fallback": 0, #similar, scr fallback / failure count
+    "scr_error": None, #this is scr error reason.
 }
 
 
@@ -241,7 +264,7 @@ def _find_scrs(phasic: np.ndarray, fs: float):
 
 def eda_features(eda: np.ndarray, fs: float = EDA_FS) -> dict:
     """Ten EDA features over one 60 s window. Input in microsiemens."""
-    eda = np.asarray(eda, dtype=np.float64).reshape(-1)
+    eda = np.asarray(eda, dtype=np.float64).reshape(-1) # turns2d np array to float-64 1d arrray
     if eda.size < int(fs * 5):  # under 5 s is not usable
         return _nan_block(EDA_FEATURES)
 
@@ -315,7 +338,7 @@ def imu_features(acc: np.ndarray, fs: float = ACC_FS) -> dict:
     if acc.ndim != 2 or acc.shape[1] != 3 or acc.shape[0] < 4:
         return _nan_block(IMU_FEATURES)
 
-    mag = np.linalg.norm(acc, axis=1)
+    mag = np.linalg.norm(acc, axis=1) # mag is the magnitude of acc vector, sqrt root of (x^2 + y^2 + z^2).
     out: dict = {}
     for i, ax in enumerate("xyz"):
         out[f"acc_{ax}_mean"] = float(np.mean(acc[:, i]))
@@ -373,15 +396,31 @@ def aggregate_short_windows(blocks: list[dict], names: list[str]) -> dict:
     return out
 
 
-def cross_features(merged: dict) -> dict:
-    """Interaction terms letting the model discount motion-driven change."""
-    frac = merged.get("motion_fraction", np.nan)
-    still = 1.0 - frac if np.isfinite(frac) else np.nan
+def cross_features(merged: dict, hr_span_motion_fraction: float | None = None) -> dict:
+    """Interaction terms letting the model discount motion-driven change.
+
+    hr_delta_x_still must be paired with a motion_fraction computed over the
+    SAME span as hr_baseline_delta. Since WIN_SHORT_HR_S (40 s) and
+    WIN_SHORT_IMU_S (15 s) diverged, `merged["motion_fraction"]` — aggregated
+    over the full 60 s EDA window — is no longer that span; the caller must
+    pass the motion_fraction aggregated over just the 40 s HR sub-window(s)
+    as `hr_span_motion_fraction`. Falls back to `merged`'s value when omitted,
+    for callers that don't need the distinction (e.g. it's already scoped).
+
+    eda_range_gated is unaffected — EDA and its motion gate both still live on
+    the full 60 s window, so it keeps using `merged["motion_fraction"]`.
+    """
+    frac_eda = merged.get("motion_fraction", np.nan)
+    still_eda = 1.0 - frac_eda if np.isfinite(frac_eda) else np.nan
+
+    frac_hr = frac_eda if hr_span_motion_fraction is None else hr_span_motion_fraction
+    still_hr = 1.0 - frac_hr if np.isfinite(frac_hr) else np.nan
+
     hr_d = merged.get("hr_baseline_delta", np.nan)
     eda_r = merged.get("eda_range", np.nan)
     return {
-        "hr_delta_x_still": hr_d * still if np.isfinite(hr_d) else np.nan,
-        "eda_range_gated": eda_r * still if np.isfinite(eda_r) else np.nan,
+        "hr_delta_x_still": hr_d * still_hr if np.isfinite(hr_d) else np.nan,
+        "eda_range_gated": eda_r * still_eda if np.isfinite(eda_r) else np.nan,
     }
 
 
@@ -389,6 +428,7 @@ def feature_vector(
     eda_win: np.ndarray,
     hr_short_blocks: list[dict],
     imu_short_blocks: list[dict],
+    imu_short_blocks_hr_span: list[dict] | None = None,
     eda_fs: float = EDA_FS,
 ) -> dict:
     """Assemble one complete feature row at an EDA-window close.
@@ -397,13 +437,23 @@ def feature_vector(
     hr_features() / imu_features() over the short windows inside this 60 s
     window. Baseline HR is applied inside hr_features() at buffer time.
 
+    imu_short_blocks_hr_span is the subset of imu_short_blocks whose sub-
+    windows fall inside the same span as hr_short_blocks (WIN_SHORT_HR_S),
+    used only to scope the hr_delta_x_still cross-term correctly — see
+    cross_features(). Defaults to imu_short_blocks when omitted.
+
     Returns a dict whose keys are exactly FEATURE_NAMES, in that order.
     """
     row: dict = {}
     row.update(eda_features(eda_win, eda_fs))
     row.update(aggregate_short_windows(hr_short_blocks, HR_FEATURES))
     row.update(aggregate_short_windows(imu_short_blocks, IMU_FEATURES))
-    row.update(cross_features(row))
+
+    hr_span_blocks = imu_short_blocks if imu_short_blocks_hr_span is None else imu_short_blocks_hr_span
+    hr_span_motion_fraction = aggregate_short_windows(hr_span_blocks, IMU_FEATURES).get(
+        "motion_fraction", np.nan
+    )
+    row.update(cross_features(row, hr_span_motion_fraction))
 
     missing = set(FEATURE_NAMES) - set(row)
     extra = set(row) - set(FEATURE_NAMES)
@@ -425,7 +475,7 @@ class HRSeries:
     fs: float
 
 
-def bvp_to_hr(bvp: np.ndarray, fs: float = 64.0, out_fs: float = 1.0) -> HRSeries:
+def bvp_to_hr(bvp: np.ndarray, fs: float = 64.0, out_fs: float = SEN0344_HR_FS_HZ) -> HRSeries:
     """Derive an HR series from WESAD's raw BVP, emulating the SEN0344 output.
 
     Training side only. WESAD gives a 64 Hz BVP waveform; the hardware gives a
@@ -433,8 +483,10 @@ def bvp_to_hr(bvp: np.ndarray, fs: float = 64.0, out_fs: float = 1.0) -> HRSerie
     inferring on the number would not transfer, so the waveform is reduced to
     a number here first.
 
-    `out_fs` is the emulated update rate, PROVISIONAL at 1 Hz. Set it to the
-    SEN0344's measured cadence once the board is on the bench, then rebuild.
+    `out_fs` is the emulated update rate: 0.25 Hz, the SEN0344's measured
+    cadence per the DFRobot_BloodOxygen_S Arduino example (`delay(4000)` — one
+    new HR value every 4 s, with the device holding its last value between
+    updates). No longer provisional; this is the bench-measured figure.
 
     For the report: this is a real domain-gap contributor. NeuroKit2's beat
     detector and DFRobot's undocumented on-board estimator are different

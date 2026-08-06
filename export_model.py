@@ -65,10 +65,58 @@ from train_model import (
 MODEL_DIR = Path("models")
 RESULTS_DIR = Path("results")
 
-ARTEFACT_VERSION = 1
+ARTEFACT_VERSION = 2
 
 # Feature sets that may never be exported: they contain the time probe.
 FORBIDDEN_SETS = {"time_only"}
+
+# Pipeline constants baked into the feature contract but not captured by
+# FEATURE_NAMES alone — two models with identical column names and different
+# window/rate constants (e.g. a pre- and post-hardware-migration pair) would
+# otherwise load interchangeably and silently disagree. Recorded at export,
+# checked on every load — see assert_provenance_matches().
+PROVENANCE_KEYS = (
+    "bvp_to_hr_out_fs",
+    "win_short_hr_s",
+    "win_short_imu_s",
+    "imu_target_fs_hz",
+    "imu_range_g",
+    "emulate_e4_quantisation",
+    "acc_units",
+)
+
+
+def current_provenance() -> dict:
+    return {
+        "bvp_to_hr_out_fs": F.SEN0344_HR_FS_HZ,
+        "win_short_hr_s": F.WIN_SHORT_HR_S,
+        "win_short_imu_s": F.WIN_SHORT_IMU_S,
+        "imu_target_fs_hz": F.IMU_TARGET_FS_HZ,
+        "imu_range_g": F.IMU_RANGE_G,
+        "emulate_e4_quantisation": F.EMULATE_E4_QUANTISATION,
+        "acc_units": "g",  # explicit, so a future unit regression is caught
+    }
+
+
+def assert_provenance_matches(bundle_provenance: dict) -> None:
+    """Mismatch between an artefact's frozen constants and the live module's
+    must raise, not warn — the same failure class assert_no_time_feature
+    already exists to prevent, just for window/rate constants instead of
+    column names."""
+    live = current_provenance()
+    mismatches = {
+        k: (bundle_provenance.get(k), live[k])
+        for k in PROVENANCE_KEYS
+        if bundle_provenance.get(k) != live[k]
+    }
+    if mismatches:
+        detail = "; ".join(
+            f"{k}: artefact={a!r} != live={b!r}" for k, (a, b) in mismatches.items()
+        )
+        raise ValueError(
+            f"artefact provenance does not match the live feature module — {detail}. "
+            "Re-export with the current code."
+        )
 
 
 def assert_no_time_feature(cols) -> None:
@@ -92,17 +140,17 @@ def assert_no_time_feature(cols) -> None:
 # --------------------------------------------------------------------------
 
 
-def compute_scale(ref: pd.DataFrame, wider: pd.DataFrame, cohort: pd.Series):
-    """Robust centre and scale, with the divisor cascade from training.
+def compute_scale(ref: pd.DataFrame, cohort: pd.Series):
+    """Robust centre and scale: ref IQR -> cohort IQR -> 1.0.
 
-    Mirrors train_model._standardise_core. Any change there must be mirrored
-    here or training and inference diverge silently.
+    No longer takes a "wider" tier: that required a subject's full window
+    set, which doesn't exist at live warm-up, so training (block-wide) and
+    live (ref-only, wider==ref) silently fit different divisors whenever a
+    reference column had zero IQR. Two tiers only, so both sides match.
     """
     centre = ref.median()
     iqr = ref.quantile(0.75) - ref.quantile(0.25)
-    wider_iqr = wider.quantile(0.75) - wider.quantile(0.25)
-    scale = iqr.where(iqr > 0, wider_iqr)
-    scale = scale.where(scale > 0, cohort)
+    scale = iqr.where(iqr > 0, cohort)
     scale = scale.where(scale > 0, 1.0)
     return centre, scale
 
@@ -115,7 +163,7 @@ def training_standardise(df: pd.DataFrame, cols: list, cohort_iqr: pd.Series, n_
         ref = df.loc[idx].sort_values(TIME_COL).head(n_ref)[cols]
         if len(ref) < 5:
             raise ValueError(f"{sid}: too few reference windows ({len(ref)})")
-        centre, scale = compute_scale(ref, block, cohort_iqr[cols])
+        centre, scale = compute_scale(ref, cohort_iqr[cols])
         out.loc[idx, cols] = ((block - centre) / scale).to_numpy()
     out[cols] = out[cols].clip(-Z_CLIP, Z_CLIP).fillna(0.0)
     return out
@@ -150,6 +198,7 @@ class StressModel:
         self.z_clip = float(bundle["z_clip"])
 
         assert_no_time_feature(self.feature_names)
+        assert_provenance_matches(bundle.get("provenance", {}))
 
         self._ref_rows: list = []
         self._centre = None
@@ -199,7 +248,7 @@ class StressModel:
         if len(self._ref_rows) >= self.n_ref_required:
             ref = pd.DataFrame(self._ref_rows)
             self._centre, self._scale = compute_scale(
-                ref, ref, self.cohort_iqr[self.feature_names]
+                ref, self.cohort_iqr[self.feature_names]
             )
         return self.ready
 
@@ -300,6 +349,7 @@ def export(
     print(f"fitting {model_kind} on {len(X)} windows, {len(cols)} features, n_ref={n_ref}")
     clf = make_model(model_kind, seed).fit(X, y)
 
+    provenance = current_provenance()
     loso = load_loso_summary(task, model_kind, feature_set, n_ref)
     metadata = {
         "task": task,
@@ -335,13 +385,14 @@ def export(
         "cohort_iqr": cohort_iqr.to_dict(),
         "n_ref_windows": n_ref,
         "z_clip": Z_CLIP,
+        "provenance": provenance,
         "metadata": metadata,
     }
 
     outfile.parent.mkdir(parents=True, exist_ok=True)
     joblib.dump(bundle, outfile)
     outfile.with_suffix(".json").write_text(
-        json.dumps({**metadata, "feature_names": cols}, indent=2)
+        json.dumps({**metadata, "feature_names": cols, "provenance": provenance}, indent=2)
     )
 
     print(f"\nexported -> {outfile}")

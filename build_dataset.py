@@ -54,7 +54,9 @@ def _write_meta(cache_path: Path, baseline_ref_s: float) -> None:
                 "baseline_ref_s": baseline_ref_s,
                 "win_eda_s": F.WIN_EDA_S,
                 "win_step_s": F.WIN_STEP_S,
-                "win_short_s": F.WIN_SHORT_S,
+                "win_short_hr_s": F.WIN_SHORT_HR_S,
+                "win_short_imu_s": F.WIN_SHORT_IMU_S,
+                "bvp_to_hr_out_fs": F.SEN0344_HR_FS_HZ,
                 "n_features": F.N_FEATURES,
             },
             indent=2,
@@ -123,7 +125,7 @@ def build_subject(
 
     # BVP -> HR once for the whole recording, not per window: it is the
     # expensive step and windowing it would break at the edges.
-    hr_series = F.bvp_to_hr(sub.bvp, fs=WRIST_FS["bvp"], out_fs=1.0)
+    hr_series = F.bvp_to_hr(sub.bvp, fs=WRIST_FS["bvp"], out_fs=F.SEN0344_HR_FS_HZ)
     hr, hr_fs = hr_series.values, hr_series.fs
 
     base_hr = _baseline_hr(hr, hr_fs, ref_s=baseline_ref_s)
@@ -143,15 +145,47 @@ def build_subject(
             t0 += F.WIN_STEP_S
             continue
 
-        hr_blocks, imu_blocks = [], []
-        s = t0
-        while s + F.WIN_SHORT_S <= t1:
-            e = s + F.WIN_SHORT_S
+        # HR and IMU sub-windows no longer share a size (WIN_SHORT_HR_S=40s vs
+        # WIN_SHORT_IMU_S=15s), so they are tiled separately. HR is anchored to
+        # window CLOSE (t1), not window start — a still-start anchor left the
+        # most recent 20s of the 60s window unused at prediction time, so the
+        # HR block was up to 20s stale. Anchoring here means the tiling walks
+        # backward from t1 in WIN_SHORT_HR_S steps, so the LAST block always
+        # ends exactly at t1.
+        #
+        # With the current constants (WIN_SHORT_HR_S=40, WIN_EDA_S=60) there is
+        # exactly one HR block per window (40 <= 60 < 80), so this loop and
+        # aggregate_short_windows() over hr_blocks are a no-op — kept anyway
+        # because both are the real code path if either constant changes, and
+        # removing them would silently break that path. Do not mistake the
+        # single-iteration behaviour for dead code.
+        n_hr_blocks = int((t1 - t0) // F.WIN_SHORT_HR_S)
+        hr_blocks = []
+        s = t1 - n_hr_blocks * F.WIN_SHORT_HR_S
+        hr_span_start = s
+        while s + F.WIN_SHORT_HR_S <= t1:
+            e = s + F.WIN_SHORT_HR_S
             hr_blocks.append(F.hr_features(_slice(hr, hr_fs, s, e), hr_fs, baseline_hr=base_hr))
-            imu_blocks.append(
-                F.imu_features(_slice(sub.acc, WRIST_FS["acc"], s, e), WRIST_FS["acc"])
-            )
             s = e
+        hr_span_end = s  # == t1 whenever n_hr_blocks > 0, by construction
+
+        # imu_blocks_hr_span collects the IMU sub-blocks overlapping the HR
+        # blocks' span [hr_span_start, hr_span_end) by sub-window midpoint —
+        # WIN_SHORT_IMU_S (15s) doesn't evenly divide WIN_SHORT_HR_S (40s), so
+        # exact containment isn't possible; midpoint overlap is the standard
+        # majority-overlap approximation. This is what the hr_delta_x_still
+        # cross-term pairs against — see features.cross_features().
+        imu_blocks, imu_blocks_hr_span = [], []
+        s = t0
+        while s + F.WIN_SHORT_IMU_S <= t1:
+            e = s + F.WIN_SHORT_IMU_S
+            blk = F.imu_features(_slice(sub.acc, WRIST_FS["acc"], s, e), WRIST_FS["acc"])
+            imu_blocks.append(blk)
+            mid = (s + e) / 2.0
+            if hr_span_start <= mid < hr_span_end:
+                imu_blocks_hr_span.append(blk)
+            s = e
+
         if not hr_blocks:
             drops["no_hr"] += 1
             t0 += F.WIN_STEP_S
@@ -161,6 +195,7 @@ def build_subject(
             eda_win=_slice(sub.eda, WRIST_FS["eda"], t0, t1),
             hr_short_blocks=hr_blocks,
             imu_short_blocks=imu_blocks,
+            imu_short_blocks_hr_span=imu_blocks_hr_span,
             eda_fs=WRIST_FS["eda"],
         )
         row.update(
@@ -244,6 +279,18 @@ def quality_report(df: pd.DataFrame, n_rebuilt: int = -1) -> int:
     if not problems:
         print("  no all-NaN or constant columns")
 
+    # Highest-risk unit regression: a live path that skips the m/s^2 -> g
+    # conversion would put acc_mag_mean near 9.8, not gravity's 1.0, and the
+    # motion gate (calibrated in g) would desynchronise from the real signal.
+    if "acc_mag_mean" in df.columns:
+        acc_med = float(df["acc_mag_mean"].median())
+        if not (0.5 <= acc_med <= 2.0):
+            print(
+                f"  [BAD] acc_mag_mean median = {acc_med:.3f} g — expected ~1.0 "
+                "(gravity). Looks like m/s^2 reached the feature layer unconverted."
+            )
+            problems += 1
+
     print("\n  motion flag rate by subject (share of windows over the ACC gate):")
     rates = df.groupby("subject")["motion_flag"].mean().sort_values()
     for sid, rate in rates.items():
@@ -303,7 +350,8 @@ def main() -> int:
     F.reset_stats()
     print(
         f"window={F.WIN_EDA_S:.0f}s step={F.WIN_STEP_S:.0f}s "
-        f"short={F.WIN_SHORT_S:.0f}s features={F.N_FEATURES} "
+        f"short_hr={F.WIN_SHORT_HR_S:.0f}s short_imu={F.WIN_SHORT_IMU_S:.0f}s "
+        f"features={F.N_FEATURES} "
         f"baseline_ref_s={args.baseline_ref_s:.0f}s"
     )
 
