@@ -1,0 +1,172 @@
+notes on the varius features calculated, taken from WESAD
+
+  0  eda_scl_mean
+  1  eda_scl_sd
+  2  eda_scr_sd
+  3  eda_range
+  4  eda_slope
+  5  eda_scr_count
+  6  eda_scr_amp_sum
+  7  eda_scr_amp_mean
+  8  eda_scr_risetime_mean
+  9  eda_scr_duration_sum
+ 10  hr_mean
+ 11  hr_sd
+ 12  hr_min
+ 13  hr_max
+ 14  hr_range
+ 15  hr_slope
+ 16  hr_baseline_delta
+ 17  acc_x_mean
+ 18  acc_y_mean
+ 19  acc_z_mean
+ 20  acc_mag_mean
+ 21  acc_x_sd
+ 22  acc_y_sd
+ 23  acc_z_sd
+ 24  acc_mag_sd
+ 25  acc_x_absint
+ 26  acc_y_absint
+ 27  acc_z_absint
+ 28  acc_mag_absint
+ 29  acc_x_peakfreq
+ 30  acc_y_peakfreq
+ 31  acc_z_peakfreq
+ 32  motion_flag
+ 33  motion_fraction
+ 34  hr_delta_x_still
+ 35  eda_range_gated
+
+ splitting this into 
+ 
+ eda - 11 features
+ hr - 8 features
+ acc - 17 features
+
+  0  eda_scl_mean
+this feature relates to the epidermal activity for skin conductance level
+  1  eda_scl_sd
+standard deviation for skin conductance level
+  2  eda_scr_sd
+standard deviation for skin conductance response
+  3  eda_range
+range of eda
+  4  eda_slope
+slope of eda signal
+  5  eda_scr_count
+count of phasic peaks for skin response
+  6  eda_scr_amp_sum
+total sum of skin response amplitudes
+  7  eda_scr_amp_mean
+average amplitude skin response
+  8  eda_scr_risetime_mean
+average when slope is increasing
+  9  eda_scr_duration_sum
+skin response duration total
+ 35  eda_range_gated
+gated range of eda signal
+
+
+
+ 10  hr_mean
+average HR during a window
+ 11  hr_sd
+hr standard deviation
+ 12  hr_min
+minimum hr during a window
+ 13  hr_max
+max hr during a window
+ 14  hr_range
+hr range; max - min
+ 15  hr_slope
+# average slope of hr over window
+ 16  hr_baseline_delta
+hr baseline change
+ 34  hr_delta_x_still
+hr change against still... compared against motion artifact
+
+
+
+ 17  acc_x_mean
+average acceleration in x direction per window
+ 18  acc_y_mean
+average acc in y direction
+ 19  acc_z_mean
+average z acceleration
+ 20  acc_mag_mean
+acceleration magnitude mean... sqrt root of acc vectors
+ 21  acc_x_sd
+acc x standard deviation
+ 22  acc_y_sd
+acc y standard deviation
+ 23  acc_z_sd
+acc z standard deviation
+ 24  acc_mag_sd
+standard deviation of acc magnitude
+ 25  acc_x_absint
+abs_int means the integral of absolute value of signal in the window
+ 26  acc_y_absint
+abs_int means the integral of absolute value of signal in the window
+ 27  acc_z_absint
+abs_int means the integral of absolute value of signal in the window
+ 28  acc_mag_absint
+magnutude absolute value integral
+ 29  acc_x_peakfreq
+acc x peark frequency
+ 30  acc_y_peakfreq
+acc y peark frequency
+ 31  acc_z_peakfreq
+acc z peark frequency
+ 32  motion_flag
+as a float, binary value. if the magnitude std is over threshold, motion flag is true
+ 33  motion_fraction
+ similar to motion_flag but this is the fraction of 
+
+
+features.py total functions
+
+reset_stats() - resets the STATS dictionary which holds a bunch of useful values.
+def _slope() - finds the slope of a signal
+def _abs_integral() - finds the integral of abs value of a parameter.
+def _peak_freq() - gives peak frequency and the index of the power
+def _nan_block - to return a dict of keys and values as NaN.
+def _decompose_eda - decomposes EDA signal into SCL and SCR. returns tonic
+def _find_scrs - finds the skin response vlaues and returns (amplitudes, rise_times_s, durations_s)
+def eda_features - gives the eda signal features.
+def hr_features - gives hr features.
+def imu_features - acc features.
+def aggregate_short_windows - short windows for HR and for IMU data.
+def cross_features - get motion artifacts out.
+def feature_vector - gives a feature row with number organized.
+def bvp_to_hr - derives hr from wesad, emulting my projects hardware.
+
+
+
+
+
+
+REPORT ORGANIZATION for ML document: Methodologies section
+
+1. provide scope of data analytics for ML algorithm. 
+2. walk through the mani flow chart.
+3. start with wesad loader
+4. go to features
+5. talk through build dataset.
+6. talk through the train_model.
+7. talk through export model. 
+8. transition to the live model.
+9. taking live files in (hardware yet to work on.)
+10. run through live_host.py -- mention uses the same features and importance
+11. output sends back to esp32 to visualize
+
+REPORT ORGANIZATION for RESULTS:
+
+1. give results of ML against WESAD dataset first.
+2. give the results of our model against my own data.
+3. look at temperature and power dissipation data.
+4. look at final images and function of the buttons as well.
+
+
+
+
+

@@ -103,7 +103,7 @@ STATS = {
     "scr_error": None, #this is scr error reason.
 }
 
-
+#reset_stats purpose is to set initial dictionary value for STATS dict.
 def reset_stats() -> None:
     for k in STATS:
         STATS[k] = None if k.endswith("_error") else 0
@@ -150,7 +150,7 @@ CROSS_FEATURES = [
     "eda_range_gated",    # eda_range * (1 - motion_fraction)
 ]
 
-FEATURE_NAMES: list[str] = EDA_FEATURES + HR_FEATURES + IMU_FEATURES + CROSS_FEATURES
+FEATURE_NAMES: list[str] = EDA_FEATURES + HR_FEATURES + IMU_FEATURES + CROSS_FEATURES # combining all features into one list
 N_FEATURES = len(FEATURE_NAMES)
 
 assert len(set(FEATURE_NAMES)) == N_FEATURES, "duplicate name in FEATURE_NAMES"
@@ -160,7 +160,7 @@ assert len(set(FEATURE_NAMES)) == N_FEATURES, "duplicate name in FEATURE_NAMES"
 # Helpers
 # --------------------------------------------------------------------------
 
-
+#ndarray is an n-dimensional array.
 def _slope(x: np.ndarray, fs: float, t: np.ndarray | None = None) -> float:
     """Least-squares slope in units per second. NaN under two samples.
 
@@ -171,33 +171,34 @@ def _slope(x: np.ndarray, fs: float, t: np.ndarray | None = None) -> float:
     x = np.asarray(x, dtype=np.float64)
     n = x.size
     if n < 2:
-        return np.nan
-    t = np.arange(n, dtype=np.float64) / fs if t is None else np.asarray(t, dtype=np.float64)
-    return float(np.polyfit(t, x, 1)[0])
+        return np.nan # returns NaN if less than 2 samples, slope undefined
+    t = np.arange(n, dtype=np.float64) / fs if t is None else np.asarray(t, dtype=np.float64) # divides entire value of x / sample time.
+    return float(np.polyfit(t, x, 1)[0]) # returns the slope of lin aggression line fit to the data.
+
 
 
 def _abs_integral(x: np.ndarray, fs: float) -> float:
     """Integral of |x| over the window, in signal-units x seconds."""
-    x = np.asarray(x, dtype=np.float64)
-    return float(np.sum(np.abs(x)) / fs) if x.size else np.nan
+    x = np.asarray(x, dtype=np.float64) # evenly spaced samples. integral can be approximated.
+    return float(np.sum(np.abs(x)) / fs) if x.size else np.nan #returns the sum of no.abs(x) / fs. which is the integral of the abs val of x / fs.
 
 
 def _peak_freq(x: np.ndarray, fs: float, band=ACC_BAND_HZ) -> float:
     """Dominant in-band frequency via periodogram. NaN if the window is short."""
     x = np.asarray(x, dtype=np.float64)
     if x.size < 8:
-        return np.nan
-    x = x - x.mean()
+        return np.nan # too few samples.
+    x = x - x.mean() # this gives the distance of x to the mean of x. removes DC componnent of signal.
     if not np.any(x):
         return 0.0
-    f, p = sps.periodogram(x, fs=fs, scaling="density")
-    sel = (f >= band[0]) & (f <= band[1])
-    return float(f[sel][int(np.argmax(p[sel]))]) if sel.any() else np.nan
+    f, p = sps.periodogram(x, fs=fs, scaling="density") # this gives spectral density of x in terms of frequency and power (f and p.)
+    sel = (f >= band[0]) & (f <= band[1]) # sel is the bool array that selects frequencies in the band.
+    return float(f[sel][int(np.argmax(p[sel]))]) if sel.any() else np.nan # returns frequencies in band, index of max power in the band.#argmax returns index of max value in array. if no values in band, return NaN.
 
 
 def _nan_block(names: list[str]) -> dict:
     return {k: np.nan for k in names}
-
+#purpose of this function is to return a dict of keys and values as NaN.
 
 # --------------------------------------------------------------------------
 # EDA block — 60 s window
@@ -343,7 +344,7 @@ def imu_features(acc: np.ndarray, fs: float = ACC_FS) -> dict:
     for i, ax in enumerate("xyz"):
         out[f"acc_{ax}_mean"] = float(np.mean(acc[:, i]))
         out[f"acc_{ax}_sd"] = float(np.std(acc[:, i]))
-        out[f"acc_{ax}_absint"] = _abs_integral(acc[:, i] - np.mean(acc[:, i]), fs)
+        out[f"acc_{ax}_absint"] = _abs_integral(acc[:, i] - np.mean(acc[:, i]), fs) #abs_int means the integral of absolute value of signal in the window
         out[f"acc_{ax}_peakfreq"] = _peak_freq(acc[:, i], fs)
 
     out["acc_mag_mean"] = float(np.mean(mag))
@@ -508,6 +509,10 @@ def bvp_to_hr(bvp: np.ndarray, fs: float = 64.0, out_fs: float = SEN0344_HR_FS_H
     trimmed = inst[: n_out * step].reshape(n_out, step)
     return HRSeries(np.nanmean(trimmed, axis=1), out_fs)
 
+
+"""
+main function prints the number of features and their names. for loop through feature names.
+"""
 
 if __name__ == "__main__":
     print(f"{N_FEATURES} features")
