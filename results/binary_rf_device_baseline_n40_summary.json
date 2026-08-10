@@ -1,0 +1,19 @@
+{
+  "task": "binary",
+  "model": "rf",
+  "feature_set": "device",
+  "n_features": 16,
+  "contract_n_features": 33,
+  "n_folds": 15,
+  "accuracy_mean": 0.8878460488066656,
+  "accuracy_sd": 0.08537369750344698,
+  "balanced_acc_mean": 0.8493211534925545,
+  "balanced_acc_sd": 0.140104545948815,
+  "macro_f1_mean": 0.8439531790504511,
+  "macro_f1_sd": 0.1459445407652921,
+  "pooled_macro_f1": 0.8616893642802619,
+  "worst_fold_macro_f1": 0.4901032702237521,
+  "best_fold_macro_f1": 0.9910439158482787,
+  "standardise": "baseline",
+  "n_ref_windows": 40
+}

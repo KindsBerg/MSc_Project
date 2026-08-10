@@ -188,6 +188,28 @@ class Stream:
         return self.t[-1] if self.t else -np.inf
 
 
+# --------------------------------------------------------------------------
+# Resting-HR reference. Two paths build it the same way: replay_wesad takes
+# one slice from the pre-loaded recording (train-parity); LiveEngine's
+# hardware path accumulates it incrementally from push_hr, since real
+# hardware has no pre-loaded array to slice. Both use this same span, mask,
+# and mean, so hr_baseline_delta means the same thing on every path that
+# builds it — build_dataset, replay, and live hardware.
+# --------------------------------------------------------------------------
+
+BASELINE_HR_REF_S = 300.0  # matches build_dataset.py's BASELINE_REF_S default
+
+
+def _baseline_hr_from_samples(hr: np.ndarray) -> float | None:
+    """Resting-HR mean over a batch of samples, or None if none are usable.
+
+    Same validity mask as replay_wesad / build_dataset: finite, >20, <220 bpm.
+    """
+    hr = np.asarray(hr, dtype=np.float64)
+    valid = hr[np.isfinite(hr) & (hr > 20) & (hr < 220)]
+    return float(np.mean(valid)) if valid.size else None
+
+
 class LiveEngine:
     """Accumulates samples, closes windows, produces predictions.
 
@@ -215,9 +237,19 @@ class LiveEngine:
         self.baseline_hr: float | None = None
         self.n_windows = 0
 
+        # Hardware-path resting-HR warm-up (see push_hr / _finalize_baseline_hr).
+        # Unused, and never populated, when the loaded model doesn't need
+        # hr_baseline_delta.
+        self._hr_ref_buffer: list[float] = []
+        self._hr_ref_finalized = False
+
         # Which columns the loaded artefact actually needs. Everything else
         # in the 36-feature row may legitimately be NaN.
         self.required = set(model.feature_names)
+
+        # Derived from the loaded bundle's own feature list, not a hardcoded
+        # set name — whatever set was exported, this follows it.
+        self._needs_baseline_hr = "hr_baseline_delta" in self.required
 
     # -- ingest ----------------------------------------------------------
 
@@ -233,6 +265,18 @@ class LiveEngine:
     def push_hr(self, t: float, bpm: float) -> None:
         self._mark(t)
         self.hr.push(t, bpm)
+
+        # Accumulate toward the resting-HR reference, same span as
+        # replay_wesad's opening slice. self.hr itself can't be used for
+        # this — it's a short ring buffer sized for one window (see Stream),
+        # not BASELINE_HR_REF_S seconds of history — so warm-up needs its
+        # own buffer. Stops
+        # accumulating the moment baseline_hr is set by any path (including
+        # replay's direct call — see set_baseline_hr), so this never
+        # recomputes or overwrites a reference that's already established.
+        if self._needs_baseline_hr and not self._hr_ref_finalized:
+            if t - self.t_origin < BASELINE_HR_REF_S:
+                self._hr_ref_buffer.append(bpm)
 
     def push_acc(self, t: float, x: float, y: float, z: float) -> None:
         """Push one accelerometer sample, already in g at F.ACC_FS.
@@ -345,12 +389,37 @@ class LiveEngine:
         return {k: row[k] for k in F.FEATURE_NAMES}
 
     def _check_required(self, row: dict) -> list:
-        """Columns the model needs that this row cannot supply."""
+        """Columns the model needs that this row cannot supply.
+
+        hr_baseline_delta is excluded while its own reference is still
+        pending (see step()) — it's expected to be NaN until baseline_hr is
+        established, and that's a warm-up state, not a missing-data error.
+        """
+        skip = (
+            {"hr_baseline_delta"}
+            if self._needs_baseline_hr and self.baseline_hr is None
+            else set()
+        )
         return [
             c
             for c in self.model.feature_names
-            if c not in row or not np.isfinite(row[c])
+            if c not in skip and (c not in row or not np.isfinite(row[c]))
         ]
+
+    def _finalize_baseline_hr(self) -> None:
+        """One-shot: turn the warm-up buffer into baseline_hr.
+
+        Only called once the full BASELINE_HR_REF_S has elapsed (see step()),
+        never on a partial buffer — a short reference is worse than none,
+        since hr_baseline_delta would then mean something different for this
+        session than for the ones it was trained against. If no valid
+        samples survived the mask, baseline_hr stays None and the engine
+        stays not-ready — see set_baseline_hr.
+        """
+        self._hr_ref_finalized = True
+        baseline = _baseline_hr_from_samples(np.asarray(self._hr_ref_buffer, dtype=np.float64))
+        if baseline is not None:
+            self.set_baseline_hr(baseline)
 
     # -- the loop --------------------------------------------------------
 
@@ -364,6 +433,13 @@ class LiveEngine:
         self.next_close = t1 + F.WIN_STEP_S
         self.n_windows += 1
 
+        if (
+            self._needs_baseline_hr
+            and not self._hr_ref_finalized
+            and t1 - self.t_origin >= BASELINE_HR_REF_S
+        ):
+            self._finalize_baseline_hr()
+
         row = self._row(t0, t1)
         bad = self._check_required(row)
         if bad:
@@ -373,10 +449,15 @@ class LiveEngine:
                 "detail": f"{len(bad)} required column(s) unusable: {bad[:3]}",
             }
 
-        # Warm-up: the wearer's own resting reference. Cannot be inherited
-        # from WESAD subjects — different skin, different baseline.
-        if not self.model.ready:
-            self.model.add_reference(row)
+        # Warm-up: two independent references, cannot be inherited from
+        # WESAD subjects — different skin, different baseline.
+        #   model.ready    — EDA standardisation reference (model.add_reference).
+        #   baseline_hr    — the wearer's own resting HR, gated in only when
+        #                    the loaded model's feature set needs it.
+        waiting_on_baseline_hr = self._needs_baseline_hr and self.baseline_hr is None
+        if not self.model.ready or waiting_on_baseline_hr:
+            if not self.model.ready:
+                self.model.add_reference(row)
             return {
                 "t": t1,
                 "state": "warmup",
@@ -388,8 +469,15 @@ class LiveEngine:
         return {"t": t1, "state": "ok", "label": label, "proba": proba, "row": row}
 
     def set_baseline_hr(self, bpm: float) -> None:
-        """Resting HR for hr_baseline_delta. Unused by the eda_only model."""
+        """Resting HR for hr_baseline_delta — required by feature sets that
+        include it (e.g. device), unused otherwise (e.g. eda_only).
+
+        Marks the warm-up buffer finalized regardless of caller, so whichever
+        path sets this first — replay's direct call or this engine's own
+        hardware-path accumulator — the other never re-triggers or overwrites it.
+        """
         self.baseline_hr = float(bpm)
+        self._hr_ref_finalized = True
 
 
 # ==========================================================================
@@ -414,11 +502,13 @@ def replay_wesad(engine: LiveEngine, sid: str, root: str, speed: float = 1.0):
     hr = hr_series.values
 
     # Resting reference from the opening of the recording, exactly as
-    # build_dataset does — chosen without reference to any label.
-    ref = hr[: int(600 * engine.hr_fs)]
-    ref = ref[np.isfinite(ref) & (ref > 20) & (ref < 220)]
-    if ref.size:
-        engine.set_baseline_hr(float(np.mean(ref)))
+    # build_dataset does — chosen without reference to any label. Same span,
+    # mask, and mean as LiveEngine's hardware-path accumulator — see
+    # BASELINE_HR_REF_S / _baseline_hr_from_samples.
+    ref = hr[: int(BASELINE_HR_REF_S * engine.hr_fs)]
+    baseline = _baseline_hr_from_samples(ref)
+    if baseline is not None:
+        engine.set_baseline_hr(baseline)
 
     duration = sub.duration()
 

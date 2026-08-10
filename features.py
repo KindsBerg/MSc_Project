@@ -48,6 +48,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import numpy as np
 from scipy import signal as sps
+from scipy.ndimage import uniform_filter1d
 
 # --------------------------------------------------------------------------
 # Configuration — change here, nowhere else.
@@ -81,10 +82,25 @@ IMU_RANGE_G = 2.0
 E4_ACC_LSB_G = 1.0 / 64.0
 EMULATE_E4_QUANTISATION = True
 
+# Bumped by hand whenever a change to this module alters cached feature
+# VALUES without necessarily changing FEATURE_NAMES (e.g. bvp_to_hr's
+# smoothing) — a column-name diff alone won't catch that, so build_dataset.py
+# folds this into the cache key to force a rebuild instead of a silent stale
+# read. No automatic hashing of code or contract; this is a manual bump.
+FEATURE_PIPELINE_VERSION = 2
+
 # SEN0344 computed-HR update cadence, measured off the vendor library (see
 # bvp_to_hr below). Named here so callers can reference it explicitly instead
 # of relying on bvp_to_hr's default.
 SEN0344_HR_FS_HZ = 0.25
+
+# Smoothing window applied to the instantaneous HR estimate BEFORE it is
+# decimated to SEN0344_HR_FS_HZ (see bvp_to_hr). Decoupled from the 4 s
+# decimation interval on purpose, so the two can be reasoned about — and
+# later swept for sensitivity — independently. 8 s (2x the device's own 4 s
+# update interval) is a provisional starting point, not a bench-measured
+# figure.
+AVERAGING_WINDOW_SECONDS = 8.0
 
 # Band for the accelerometer peak-frequency feature (human movement).
 ACC_BAND_HZ = (0.3, 10.0)
@@ -126,12 +142,12 @@ EDA_FEATURES = [
     "eda_scr_duration_sum",
 ]
 
+# No hr_min/hr_max/hr_range: order statistics on ~10 samples per 40 s window
+# swing on whichever single sample lands there, so they mostly encode which
+# beat happened to fall in the window rather than a stable property of it.
 HR_FEATURES = [
     "hr_mean",
     "hr_sd",
-    "hr_min",
-    "hr_max",
-    "hr_range",
     "hr_slope",
     "hr_baseline_delta",
 ]
@@ -320,9 +336,6 @@ def hr_features(hr: np.ndarray, fs: float, baseline_hr: float | None = None) -> 
     return {
         "hr_mean": mean,
         "hr_sd": float(np.std(hr)) if hr.size > 1 else 0.0,
-        "hr_min": float(np.min(hr)),
-        "hr_max": float(np.max(hr)),
-        "hr_range": float(np.ptp(hr)),
         "hr_slope": _slope(hr, fs, t=t),
         "hr_baseline_delta": mean - float(baseline_hr) if baseline_hr is not None else np.nan,
     }
@@ -476,7 +489,12 @@ class HRSeries:
     fs: float
 
 
-def bvp_to_hr(bvp: np.ndarray, fs: float = 64.0, out_fs: float = SEN0344_HR_FS_HZ) -> HRSeries:
+def bvp_to_hr(
+    bvp: np.ndarray,
+    fs: float = 64.0,
+    out_fs: float = SEN0344_HR_FS_HZ,
+    avg_window_s: float = AVERAGING_WINDOW_SECONDS,
+) -> HRSeries:
     """Derive an HR series from WESAD's raw BVP, emulating the SEN0344 output.
 
     Training side only. WESAD gives a 64 Hz BVP waveform; the hardware gives a
@@ -489,6 +507,12 @@ def bvp_to_hr(bvp: np.ndarray, fs: float = 64.0, out_fs: float = SEN0344_HR_FS_H
     new HR value every 4 s, with the device holding its last value between
     updates). No longer provisional; this is the bench-measured figure.
 
+    Smooth-then-decimate, in that order: `avg_window_s` first attenuates
+    beat-to-beat HR variation the SEN0344 will never report, THEN the result
+    is decimated to out_fs. Decimating first would alias that high-frequency
+    variation back into band and inflate hr_sd with detail the device cannot
+    deliver.
+
     For the report: this is a real domain-gap contributor. NeuroKit2's beat
     detector and DFRobot's undocumented on-board estimator are different
     algorithms with different latency and motion rejection, so "mean HR" is
@@ -500,14 +524,21 @@ def bvp_to_hr(bvp: np.ndarray, fs: float = 64.0, out_fs: float = SEN0344_HR_FS_H
     sig, info = nk.ppg_process(bvp, sampling_rate=fs)
     inst = sig["PPG_Rate"].to_numpy()
 
-    # Average the per-sample instantaneous rate within each output interval —
-    # closer to an on-board estimator than naive subsampling.
+    # Smooth: rolling mean at the native BVP-derived rate. mode="nearest"
+    # holds the edge value instead of zero-padding, so the first/last
+    # avg_window_s/2 aren't biased toward zero by an implicit zero border.
+    win = max(int(round(avg_window_s * fs)), 1)
+    smoothed = uniform_filter1d(inst, size=win, mode="nearest")
+
+    # Decimate: one smoothed sample per output interval, taken from the END
+    # of each interval — matching "device holds its last computed value"
+    # rather than a value that (post-smoothing) still leaks a bit of the
+    # interval's future into the past.
     step = int(round(fs / out_fs))
-    n_out = inst.size // step
+    n_out = smoothed.size // step
     if n_out == 0:
         return HRSeries(np.array([]), out_fs)
-    trimmed = inst[: n_out * step].reshape(n_out, step)
-    return HRSeries(np.nanmean(trimmed, axis=1), out_fs)
+    return HRSeries(smoothed[step - 1 : n_out * step : step], out_fs)
 
 
 """

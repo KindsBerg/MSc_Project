@@ -1,0 +1,19 @@
+{
+  "task": "binary",
+  "model": "rf",
+  "feature_set": "device_nomotionflag",
+  "n_features": 15,
+  "contract_n_features": 33,
+  "n_folds": 15,
+  "accuracy_mean": 0.8895941689946782,
+  "accuracy_sd": 0.08850042799520547,
+  "balanced_acc_mean": 0.8512033098396936,
+  "balanced_acc_sd": 0.14426694485314664,
+  "macro_f1_mean": 0.8449887750122795,
+  "macro_f1_sd": 0.15201500686558084,
+  "pooled_macro_f1": 0.863810550963041,
+  "worst_fold_macro_f1": 0.4820451127819549,
+  "best_fold_macro_f1": 0.994014460116155,
+  "standardise": "baseline",
+  "n_ref_windows": 40
+}

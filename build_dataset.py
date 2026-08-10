@@ -51,6 +51,7 @@ def _write_meta(cache_path: Path, baseline_ref_s: float) -> None:
     _meta_path(cache_path).write_text(
         json.dumps(
             {
+                "feature_pipeline_version": F.FEATURE_PIPELINE_VERSION,
                 "baseline_ref_s": baseline_ref_s,
                 "win_eda_s": F.WIN_EDA_S,
                 "win_step_s": F.WIN_STEP_S,
@@ -229,7 +230,7 @@ def build_subject(
 
 
 def _cache_path(sid: str) -> Path:
-    return CACHE_DIR / f"{sid}_features.parquet"
+    return CACHE_DIR / f"{sid}_features_v{F.FEATURE_PIPELINE_VERSION}.parquet"
 
 
 def _write(df: pd.DataFrame, path: Path) -> Path:
@@ -391,7 +392,9 @@ def main() -> int:
     problems = quality_report(all_df, n_rebuilt=n_rebuilt)
 
     if args.combine:
-        combined_path = _write(all_df, CACHE_DIR / "wesad_features.parquet")
+        combined_path = _write(
+            all_df, CACHE_DIR / f"wesad_features_v{F.FEATURE_PIPELINE_VERSION}.parquet"
+        )
         _write_meta(combined_path, args.baseline_ref_s)
         print(f"\ncombined -> {combined_path}")
     return 1 if problems else 0

@@ -63,34 +63,71 @@ def _drop(cols, remove) -> list:
     return [c for c in cols if c not in rm]
 
 
-# Four sets, each with a distinct job:
-#   all        every feature in the contract; the ablation baseline
-#   clean      headline configuration, posture means removed
-#   eda_only   deployment-realistic: the custom EDA front end alone, and the
-#              only set whose inputs all exist outside a lab protocol
-#   time_only  control, not a result — see sweep_table()
+# IMU contribution to `device`: motion magnitude and the motion flag only —
+# not the per-axis or sd/absint/peakfreq columns, which the SEN0344/EDA/IMU
+# stack doesn't need to reproduce for a stress read.
+DEVICE_IMU_FEATURES = ["acc_mag_mean", "motion_flag"]
+
+# Everything the deployable hardware can actually produce: the custom EDA
+# front end, the four-feature HR block (see features.py's HR_FEATURES), and
+# minimal IMU motion context. Excluded, and why:
+#   HRV features     — SEN0344 firmware blocks raw BVP FIFO access, so no
+#                       beat-to-beat intervals exist to compute HRV from.
+#   temperature      — the LM75BD on this PCB reads board self-heating, not
+#                       skin temperature; a different instrument entirely.
+#   absolute posture — wrist orientation from WESAD's Empatica placement
+#                       doesn't transfer to this device's wrist mount.
+DEVICE_FEATURES = list(F.EDA_FEATURES) + list(F.HR_FEATURES) + DEVICE_IMU_FEATURES
+
+# Six sets, each with a distinct job:
+#   all                every feature in the contract; defined for --features
+#                      but not part of the reported sweep
+#   clean              headline configuration, posture means removed
+#   eda_only           deployment-realistic: the custom EDA front end alone;
+#                      defined for --features but not part of the reported sweep
+#   device             the deployable hardware configuration — see DEVICE_FEATURES
+#   device_nomotionflag  device minus motion_flag — see its definition below
+#   time_only          control, not a result — see sweep_table()
 FEATURE_SETS = {
     "all": list(F.FEATURE_NAMES),
     "clean": _drop(F.FEATURE_NAMES, POSTURE_FEATURES),
     "eda_only": list(F.EDA_FEATURES),
+    "device": DEVICE_FEATURES,
+    # motion_flag's reference-window IQR is zero for 13/15 subjects, so it
+    # falls through the divisor cascade to the unit path and enters the
+    # matrix untransformed while every other feature is standardised.
+    "device_nomotionflag": _drop(DEVICE_FEATURES, ["motion_flag"]),
     "time_only": [TIME_COL],
 }
 
-SWEEP_ORDER = ["all", "clean", "eda_only", "time_only"]
+SWEEP_ORDER = ["clean", "device", "device_nomotionflag", "time_only"]
 
 
 def load_table(cache_dir: Path) -> pd.DataFrame:
-    for name in ("wesad_features.parquet", "wesad_features.csv.gz"):
+    """Load the feature cache, pinned to features.py's current pipeline version.
+
+    Filenames are derived from FEATURE_PIPELINE_VERSION rather than hardcoded
+    here, so build_dataset.py (which writes them) and this loader can't drift
+    apart. Deliberately not permissive: a cache built under an older version
+    won't match and won't be silently substituted — see FEATURE_PIPELINE_VERSION
+    in features.py for why that matters.
+    """
+    version = F.FEATURE_PIPELINE_VERSION
+    for name in (f"wesad_features_v{version}.parquet", f"wesad_features_v{version}.csv.gz"):
         p = cache_dir / name
         if p.is_file():
             df = pd.read_parquet(p) if p.suffix == ".parquet" else pd.read_csv(p)
             print(f"loaded {p}  ({len(df)} rows)")
             return df
-    parts = sorted(cache_dir.glob("S*_features.parquet")) + sorted(
-        cache_dir.glob("S*_features.csv.gz")
+    parts = sorted(cache_dir.glob(f"S*_features_v{version}.parquet")) + sorted(
+        cache_dir.glob(f"S*_features_v{version}.csv.gz")
     )
     if not parts:
-        raise FileNotFoundError(f"no feature cache in {cache_dir}")
+        raise FileNotFoundError(
+            f"no feature_pipeline_version={version} cache found in {cache_dir} "
+            f"(looked for wesad_features_v{version}.parquet/.csv.gz and "
+            f"S*_features_v{version}.parquet/.csv.gz)"
+        )
     df = pd.concat(
         [pd.read_parquet(p) if p.suffix == ".parquet" else pd.read_csv(p) for p in parts],
         ignore_index=True,
@@ -576,13 +613,14 @@ def sweep_table(rows: list) -> None:
               f"{r['accuracy_mean']:>9.3f}{r['balanced_acc_mean']:>9.3f}"
               f"{r['macro_f1_mean']:>10.3f}{r['macro_f1_sd']:>8.3f}")
 
-    print("\ndelta vs 'all' (balanced accuracy)")
+    delta_base = "clean"
+    print(f"\ndelta vs '{delta_base}' (balanced accuracy)")
     for (task, model), grp in pd.DataFrame(rows).groupby(["task", "model"]):
-        base = grp[grp["feature_set"] == "all"]
+        base = grp[grp["feature_set"] == delta_base]
         if base.empty:
             continue
         b = float(base["balanced_acc_mean"].iloc[0])
-        for _, r in grp[grp["feature_set"] != "all"].iterrows():
+        for _, r in grp[grp["feature_set"] != delta_base].iterrows():
             print(f"  {task}/{model}  {r['feature_set']:<18} "
                   f"{r['balanced_acc_mean'] - b:+.3f}")
 
@@ -591,9 +629,9 @@ def sweep_table(rows: list) -> None:
         "\n              recoverable from session position alone, and every"
         "\n              other row inherits that as a caveat."
         "\n  clean       headline configuration: posture means removed."
-        "\n  eda_only    deployment-realistic figure — the custom EDA front"
-        "\n              end alone, and the only row whose inputs all exist"
-        "\n              outside a fixed-order lab protocol."
+        "\n  device      deployable hardware configuration — EDA front end +"
+        "\n              the four-feature HR block + motion magnitude/flag,"
+        "\n              exactly what the SEN0344/EDA/IMU stack can produce."
     )
 
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
