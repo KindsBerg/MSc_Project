@@ -18,12 +18,13 @@ MSc Individual Project, University of Hertfordshire.
 | File | Role |
 |---|---|
 | `wesad_loader.py` | Parses WESAD subject pickles into aligned wrist streams |
-| `verify_wesad.py` | Acceptance test for the raw dataset — run before anything else |
-| `features.py` | **The shared feature module.** Single implementation of all 42 features |
+| `features.py` | **The shared feature module.** Single implementation of all 33 features, imported by training and by the live host |
 | `build_dataset.py` | Slides windows, extracts features, attaches labels, caches per subject |
 | `train_model.py` | Leave-one-subject-out evaluation, ablation sweep, confound diagnostics |
-| `diagnose_subjects.py` | Forensics for failing folds |
-| `export_model.py` | Fits the final model and freezes the feature contract into an artefact |
+| `diagnose_subjects.py` | Cohort-wide forensics — responder/non-responder/inverted-responder check, standardisation-reference health |
+| `verify_subjects.py` | Targeted forensics for individual failing folds — degenerate prediction, scaling collapse, response-direction disagreement |
+| `export_model.py` | Fits the final model, freezes the feature contract into an artefact, and defines `StressModel` (the live inference wrapper) |
+| `live_host.py` | Streaming inference engine (`LiveEngine`). Replays a WESAD subject through the exact windowing/feature code the live host will run, with no hardware attached |
 | `validate_migration.py` | Gate for hardware-constant migrations: constants, cache freshness, unit regression, standardisation agreement, artefact provenance |
 
 `features.py` is imported by both the training build and the live host pipeline. One
@@ -36,7 +37,7 @@ implementation, no drift — the same columns in the same order on both sides.
 ### 1. Dependencies
 
 ```bash
-python -m pip install numpy scipy pandas scikit-learn neurokit2 cvxopt pyarrow joblib matplotlib
+python -m pip install numpy scipy pandas scikit-learn neurokit2 cvxopt pyarrow joblib
 ```
 
 `cvxopt` is **required**, not optional. Without it NeuroKit2 cannot run cvxEDA and the
@@ -58,91 +59,73 @@ S1 and S12 are absent — excluded by the original authors for sensor faults.
 
 ### 3. Local config
 
-```bash
-cp config.example.py config.py
+Create `config.py` in the repository root:
+
+```python
+# config.py — single source of truth for project paths
+WESAD_ROOT = r"C:\path\to\your\unzipped\WESAD"
+CACHE_DIR = "cache"
 ```
 
-Then edit `config.py` to point at your unzipped dataset. It is gitignored because the
-path is machine-specific.
+It is gitignored because the path is machine-specific.
 
 ---
 
 ## Running
 
 ```bash
-python verify_wesad.py                       # confirm the dataset loads and aligns
-python verify_wesad.py --plot S2             # visual alignment check (needs matplotlib)
-
 python build_dataset.py --check              # dependency preflight
 python build_dataset.py --force --combine    # build the feature table (~10 min)
 
 python train_model.py --diagnose             # time-confound correlation check
 python train_model.py --task both --model rf --sweep
 
-python export_model.py                                   # clean + RF, binary
-python export_model.py --features eda_only --out models/stress_model_eda.joblib
-python export_model.py --verify                          # load and self-test
+python export_model.py                        # fit 'device' (deployment set), binary, RF
+python export_model.py --features clean       # research-set variant
+python export_model.py --verify               # load and self-test only
+
+python diagnose_subjects.py                   # cohort-wide responder/scaling forensics
+python verify_subjects.py --subjects S2 S3    # targeted forensics for named folds
+
+python live_host.py --replay S2               # exercise the live inference path with no hardware
+python validate_migration.py                  # regression gate after a hardware-constant change
 ```
 
-Run `verify_wesad.py` first and don't proceed until it passes. Every downstream stage
-assumes the label track is correctly aligned to the wrist streams, and a constant
-offset would pass most assertions silently — which is why that script also plots EDA
-against the protocol labels.
+There is no dataset-alignment acceptance test in the current pipeline; `build_dataset.py`
+is the first stage to run against a freshly downloaded copy of WESAD, and its per-subject
+console output (accepted/rejected window counts, cvxEDA fallback rate, motion-flag rate) is
+the first place a bad download or a broken path would show up.
 
 ---
 
 ## Results
 
-Leave-one-subject-out, 15 folds, Random Forest, per-subject robust scaling.
-Full numbers in `results/ablation_sweep.csv`. Current figures are post-migration (SEN0344
-0.25 Hz HR cadence, 40 s HR window) — see "Migration: before/after" below for what changed
-and why.
+Leave-one-subject-out, 15 folds, Random Forest, per-subject robust scaling
+(`--standardise baseline`, `N_REF_WINDOWS=40`). Full numbers in `results/ablation_sweep.csv`
+and `results/*_n40_*` (folds, confusion matrix, permutation importance, per task).
 
 | Feature set | n | Binary balanced acc | 3-class balanced acc |
 |---|---|---|---|
-| `all` | 36 | 0.844 | 0.648 |
-| **`clean`** | **32** | **0.860** | **0.669** |
-| `eda_only` | 10 | 0.829 | 0.583 |
-| `time_only` | 1 | 0.960 | 0.903 |
+| `clean` | 29 | 0.849 ± 0.138 | 0.649 ± 0.136 |
+| **`device`** | **15** | **0.851 ± 0.144** | **0.654 ± 0.140** |
+| `time_only` (control) | 1 | 0.960 ± 0.046 | 0.903 ± 0.106 |
 
-`clean` drops the posture (mean-acceleration) channels. It beats the full feature set with
-four fewer features.
+`clean` is the full 33-feature contract minus the four posture (mean-acceleration)
+channels — the research-oriented headline configuration. `device` is what the
+deployable hardware can actually produce: the custom EDA front end, the four-feature HR
+block, and motion magnitude alone (`acc_mag_mean`; the binary `motion_flag` was dropped —
+its reference-window IQR is zero for 13/15 subjects, so it entered the model unstandardised
+and contributed no measurable accuracy). `device` matches `clean` to within fold noise
+despite using roughly half the columns, which is the central deployability result: the
+hardware-realistic feature reduction costs nothing measurable.
 
-`eda_only` uses the EDA block alone — the signal the custom analog front-end exists to
-measure — and is the most deployment-realistic figure.
+`eda_only` (the EDA block alone, 10 features) and `all` (the unreduced 33-feature
+contract) are available via `--features` for per-modality ablation but are not part of the
+reported sweep — see `SWEEP_ORDER` in `train_model.py`.
 
-### Migration: before/after
-
-The SEN0344 and LSM6DS3TR-C hardware facts (§1-§5 of the migration, not reproduced here)
-resolved two provisional constants and replaced the IMU part. Both sides of this table use
-the standard `train_model.py` sweep at its own `N_REF_WINDOWS=40` default, so the
-comparison is config-matched, not just same-codebase:
-
-| Config | Binary balanced acc — before (n_ref=40) | after (n_ref=40) | Δ |
-|---|---|---|---|
-| `clean` | 0.8724 ± 0.1321 | 0.8596 ± 0.1182 | −0.0128 |
-| `eda_only` | 0.8285 ± 0.1704 | 0.8285 ± 0.1704 | **0.0000** (bit-exact) |
-
-`eda_only` is untouched by construction — it only reads the EDA block, which this
-migration never modified — and the two runs agree to 15 decimal places, which is itself a
-useful reproducibility check (RF `random_state` is pinned). `clean`'s margin over
-`eda_only` narrowed from +0.044 to +0.031. Smaller than initially estimated: an earlier
-draft of this table compared against a stale `n_ref=100` run and additionally carried a
-since-fixed bug where the 40 s HR sub-window was anchored to window *start* rather than
-window *close*, leaving the most recent 20 s of every 60 s window's HR signal unused at
-prediction time. Both are corrected here. The qualitative result is unchanged: `clean`
-converges toward `eda_only` rather than holding its pre-migration margin, which is evidence
-for the project's central claim — that direct EDA measurement, not HR derived from a
-rate-limited PPG estimator, is the defensible core of this pipeline.
-
-Pre-migration comparison baseline: `results/pre_migration_sen0344_lsm6ds3/
-binary_rf_{clean,eda_only}_baseline_n40_summary.json`. A separately-recorded pre-migration
-figure of `eda_only=0.846` traces to `results/ablation_sweep_prior_contract.csv`, the
-**older 42-feature contract** — a different feature set (this codebase has been on the
-36-feature contract for some time) and not comparable to any number in this table.
-`results/pre_migration_n_ref_100_not_comparable/` holds a full `n_ref=100` sweep that was
-briefly (and incorrectly) used as the "before" figure; kept for the record, excluded from
-comparison — see the README in that directory.
+`time_only` is elapsed session time as the *only* feature — see the methodological note
+below. It is a control, not a result, and every physiological row should be read next to
+it.
 
 ---
 
@@ -154,11 +137,14 @@ either side of the split and measures memorisation of a recording rather than
 generalisation to a person.
 
 **Session-order control.** `time_only` is elapsed time since recording start as a single
-feature, with no physiology at all. It scores 0.960 binary balanced accuracy — above
-every physiological configuration and above both published WESAD wrist-only ceilings
-(~0.88 / ~0.76). WESAD runs its condition blocks in a fixed order at similar wall-clock
-offsets for every subject, so session position generalises across subjects. It is
-reported as a control, not a result, and every other figure should be read alongside it.
+feature, with no physiology at all. It scores 0.960 binary / 0.903 3-class balanced
+accuracy — above every physiological configuration and above both published WESAD
+wrist-only ceilings (~0.88 / ~0.76). WESAD counterbalances stress/amusement order, but
+unequal block lengths and the meditation blocks excluded from the 3-class scope leave most
+of the pooled stress timeline with no non-stress window from any subject, so session
+position still predicts the label (mechanism detailed in
+`train_model.diagnose_time_confound`). It is reported as a control, not a result, and every
+other figure should be read alongside it.
 
 **Baseline references avoid label leakage.** Per-subject standardisation uses the first
 N accepted windows of each recording, chosen without reference to any label. Averaging
@@ -169,21 +155,17 @@ over windows labelled *baseline* would use the target to construct a predictor.
 and re-checks it on load and on every prediction.
 
 **`t_start` is a diagnostic only.** It has no meaning at inference — live monitoring has
-no protocol clock. It is blocked at export, at load and at predict, and the three
-time-containing feature sets cannot be exported.
+no protocol clock. `time_only`, the one feature set built from it, is blocked at export,
+at load and at predict (`export_model.FORBIDDEN_SETS`).
 
-**Known limitation: standardisation can diverge in one narrow, by-design edge case.**
-`export_model.training_standardise` and `StressModel.transform` both drive the same
-`compute_scale()` primitive, but with a different "wider" fallback operand when a
-reference window's IQR is zero for some feature: training falls back to that *subject's
-whole block* (all its windows, training-time only information); live inference falls back
-to the *reference buffer alone*, since a live wearer's future windows don't exist yet.
-`validate_migration.py`'s standardisation-agreement check confirmed the two procedures
-agree exactly on realistic data, then deliberately triggered this fallback branch and
-measured a **19.47** divergence on the probe column — real, and by design, not a bug, but
-worth knowing about if a real feature column ever has zero variance across a wearer's
-reference window (unlikely for continuous physiological signals over 40 windows, but not
-provably impossible). Not changed as part of this migration; flagged for awareness.
+**Training/live standardisation agreement is verified, not assumed.** An earlier version
+of `compute_scale()` took a three-tier fallback (reference IQR → subject-wide IQR → cohort
+IQR) where training's "subject-wide" tier used information (the subject's full window set)
+that doesn't exist yet at live warm-up, so training and live could silently fit different
+divisors — measured at a 19.47 divergence on a synthetic probe column. `compute_scale()`
+now uses two tiers only (reference → cohort), so both sides drive the same function on the
+same inputs. `validate_migration.py`'s standardisation-agreement check (`S7.5`) verifies
+exact agreement on realistic data and on that former divergence probe.
 
 ---
 
@@ -257,16 +239,17 @@ changed. Both are one-off migrations, not ongoing tuning:
 
 ```
 ├── wesad_loader.py          # dataset parsing
-├── verify_wesad.py          # dataset acceptance test
-├── features.py              # shared feature module (training + live)
+├── features.py               # shared feature module (training + live)
 ├── build_dataset.py         # windowing and feature extraction
 ├── train_model.py           # LOSO evaluation and ablation
-├── diagnose_subjects.py     # per-subject forensics
+├── diagnose_subjects.py     # cohort-wide forensics
+├── verify_subjects.py       # per-fold targeted forensics
 ├── export_model.py          # model freezing and live inference wrapper
+├── live_host.py             # streaming inference engine / WESAD replay harness
 ├── validate_migration.py    # hardware-constant migration gate
-├── config.example.py        # copy to config.py and set your dataset path
-├── notes.txt                # signal architecture: live path, training path, and the join
-└── results/                 # committed evaluation output — the evidence for the numbers above
+├── config.py                 # gitignored — WESAD_ROOT and CACHE_DIR, machine-specific
+├── notes.txt                 # signal architecture: live path, training path, and the join
+└── results/                  # committed evaluation output — the evidence for the numbers above
 ```
 
 Not tracked: `WESAD/` (the dataset), `cache/` (regenerable feature tables), `models/`
@@ -279,8 +262,8 @@ Not tracked: `WESAD/` (the dataset), `cache/` (regenerable feature tables), `mod
 The offline pipeline is complete and produces a deployable artefact. No data from the
 physical device has entered it yet — all figures above are WESAD-to-WESAD.
 
-Two constants that were provisional pending hardware are now resolved from bench
-measurement, not guesses:
+Two constants that were provisional pending hardware are resolved from bench measurement,
+not guesses:
 
 - `WIN_SHORT_HR_S = 40.0`, `WIN_SHORT_IMU_S = 15.0` (was one constant, `WIN_SHORT_S`) —
   split because the SEN0344's measured HR update cadence (0.25 Hz, see Hardware notes)
@@ -293,6 +276,12 @@ One constant remains provisional pending worn recordings:
 - `MOTION_STD_THRESHOLD_G = 0.05` — retune against real worn data once available
 
 Each is a single constant by design; changing it costs one rebuild of the feature table.
+
+Most recently: the `device` feature set dropped `motion_flag` (it fell through the
+per-subject standardisation cascade unscaled on most subjects and carried no measurable
+accuracy — see Results above), and `train_model.load_baseline_ref_s` was fixed to look up
+the *versioned* cache sidecar (`wesad_features_v{N}.meta.json`) instead of an unversioned
+name that no longer matched anything the current pipeline writes.
 
 ---
 
