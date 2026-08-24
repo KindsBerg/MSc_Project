@@ -1,17 +1,17 @@
 """
-build_dataset.py — WESAD pickles -> windowed feature table.
+build_dataset.py -- turns the WESAD pickles into a windowed feature table.
 
-Slides the 60 s EDA window over each subject, computes the shared feature
-vector from features.py, attaches the protocol label, caches per subject.
+slides the 60s EDA window across each subject, runs the shared feature
+vector from features.py, tags it with the protocol label, caches per subject.
 
-    python build_dataset.py --check                        # dependencies only
+    python build_dataset.py --check                        # just check deps
     python build_dataset.py --force --combine              # full rebuild
-    python build_dataset.py --force --baseline-ref-s 300   # rebuild at 300 s
+    python build_dataset.py --force --baseline-ref-s 300   # rebuild at 300s ref
 
-hr_baseline_delta is referenced against the first `baseline_ref_s` seconds of
-each recording at BUILD time, independent of the training-side reference
-window. Because it is baked into the cache it travels with the cache in a
-.meta.json sidecar, so a warm-up analysis can never run without knowing it.
+hr_baseline_delta gets its reference from the first `baseline_ref_s` seconds
+of each recording at BUILD time -- separate from the training-side reference
+window. this gets baked into the cache and saved in a .meta.json sidecar so
+it travels with it.
 """
 
 from __future__ import annotations
@@ -29,12 +29,11 @@ import pandas as pd
 import features as F
 from wesad_loader import LABEL_FS, LABEL_NAMES, SUBJECTS, WRIST_FS, load_subject
 
-# NeuroKit2's eda_peaks calls np.nanmin on windows with zero detected SCRs,
-# raising an all-NaN RuntimeWarning per quiet window. Zero SCRs in a calm
-# baseline window is the physiologically correct outcome, not an error, so
-# the warning is silenced HERE (batch build only) — never in features.py,
-# where the same condition on the live path can mean a real electrode
-# dropout and should stay visible.
+# neurokit2's eda_peaks calls np.nanmin on windows with zero SCRs, which
+# throws an all-NaN RuntimeWarning per quiet window. that's normal for a
+# calm baseline window, not an error -- so silencing it here (batch build
+# only, NOT in features.py where the same thing on the live path could
+# actually mean a dead electrode)
 warnings.filterwarnings("ignore", message="All-NaN slice encountered", category=RuntimeWarning)
 
 try:
@@ -42,9 +41,9 @@ try:
 except Exception:  # noqa: BLE001
     WESAD_ROOT = None
 
-# Resting-HR reference taken from the opening of the recording. 300 s sits
-# inside every subject's baseline block and matches the EDA settling period,
-# so HR is not the binding constraint on device warm-up.
+# resting HR ref comes from the start of the recording. 300s fits inside
+# every subject's baseline block and matches the EDA settling time, so HR
+# isn't the thing limiting device warm-up
 BASELINE_REF_S = 300.0
 
 CACHE_DIR = Path("cache")
@@ -75,7 +74,7 @@ def _write_meta(cache_path: Path, baseline_ref_s: float) -> None:
 
 
 def preflight() -> bool:
-    """cvxopt missing => cvxEDA silently becomes a median filter. Gate on it."""
+    """checks cvxopt is actually installed -- without it cvxEDA quietly turns into a median filter"""
     ok = True
     try:
         import neurokit2 as nk
@@ -128,13 +127,12 @@ def build_subject(
     sid: str, root: str, limit: int | None = None, baseline_ref_s: float = BASELINE_REF_S
 ) -> pd.DataFrame:
     t_start = time.time()
-    # Per-subject delta, so one bad subject cannot hide in a run-wide total
-    # (and so cache hits, which contribute nothing, stay visible as zeros).
+    # per-subject delta so one bad subject doesn't hide in a run-wide total
     stats_before = dict(F.STATS)
     sub = load_subject(sid, root)
 
-    # BVP -> HR once for the whole recording, not per window: it is the
-    # expensive step and windowing it would break at the edges.
+    # BVP -> HR once for the whole recording, not per window -- it's the
+    # expensive step and windowing it would mess up the edges
     hr_series = F.bvp_to_hr(sub.bvp, fs=WRIST_FS["bvp"], out_fs=F.SEN0344_HR_FS_HZ)
     hr, hr_fs = hr_series.values, hr_series.fs
 
@@ -155,20 +153,13 @@ def build_subject(
             t0 += F.WIN_STEP_S
             continue
 
-        # HR and IMU sub-windows no longer share a size (WIN_SHORT_HR_S=40s vs
-        # WIN_SHORT_IMU_S=15s), so they are tiled separately. HR is anchored to
-        # window CLOSE (t1), not window start — a still-start anchor left the
-        # most recent 20s of the 60s window unused at prediction time, so the
-        # HR block was up to 20s stale. Anchoring here means the tiling walks
-        # backward from t1 in WIN_SHORT_HR_S steps, so the LAST block always
-        # ends exactly at t1.
-        #
-        # With the current constants (WIN_SHORT_HR_S=40, WIN_EDA_S=60) there is
-        # exactly one HR block per window (40 <= 60 < 80), so this loop and
-        # aggregate_short_windows() over hr_blocks are a no-op — kept anyway
-        # because both are the real code path if either constant changes, and
-        # removing them would silently break that path. Do not mistake the
-        # single-iteration behaviour for dead code.
+        # HR (40s) and IMU (15s) sub-windows are different sizes now so they
+        # get tiled separately. HR is anchored to window CLOSE (t1) not
+        # start -- anchoring at start left the most recent 20s of HR signal
+        # unused at prediction time. with the current constants there's only
+        # ever 1 HR block per window so this loop looks like a no-op, but
+        # it's the real code path if the constants ever change -- don't
+        # delete it thinking it's dead code.
         n_hr_blocks = int((t1 - t0) // F.WIN_SHORT_HR_S)
         hr_blocks = []
         s = t1 - n_hr_blocks * F.WIN_SHORT_HR_S
@@ -177,14 +168,12 @@ def build_subject(
             e = s + F.WIN_SHORT_HR_S
             hr_blocks.append(F.hr_features(_slice(hr, hr_fs, s, e), hr_fs, baseline_hr=base_hr))
             s = e
-        hr_span_end = s  # == t1 whenever n_hr_blocks > 0, by construction
+        hr_span_end = s  # == t1 whenever n_hr_blocks > 0
 
-        # imu_blocks_hr_span collects the IMU sub-blocks overlapping the HR
-        # blocks' span [hr_span_start, hr_span_end) by sub-window midpoint —
-        # WIN_SHORT_IMU_S (15s) doesn't evenly divide WIN_SHORT_HR_S (40s), so
-        # exact containment isn't possible; midpoint overlap is the standard
-        # majority-overlap approximation. This is what the hr_delta_x_still
-        # cross-term pairs against — see features.cross_features().
+        # imu_blocks_hr_span = IMU sub-blocks overlapping the HR span, by
+        # midpoint (15s doesn't divide evenly into 40s so exact containment
+        # isn't possible). this is what hr_delta_x_still pairs against, see
+        # cross_features() in features.py
         imu_blocks, imu_blocks_hr_span = [], []
         s = t0
         while s + F.WIN_SHORT_IMU_S <= t1:
@@ -247,7 +236,7 @@ def _write(df: pd.DataFrame, path: Path) -> Path:
     try:
         df.to_parquet(path, index=False)
         return path
-    except Exception:  # noqa: BLE001 — no pyarrow
+    except Exception:  # noqa: BLE001 — no pyarrow installed, fall back to csv
         alt = path.with_suffix(".csv.gz")
         df.to_csv(alt, index=False, compression="gzip")
         return alt
@@ -262,8 +251,8 @@ def _existing(sid: str) -> Path | None:
 
 def _read(path: Path) -> pd.DataFrame:
     df = pd.read_parquet(path) if path.suffix == ".parquet" else pd.read_csv(path)
-    # A cache carries no record of the contract that built it; read back under
-    # a different FEATURE_NAMES it would concatenate silently.
+    # cache doesn't remember what contract built it -- if FEATURE_NAMES
+    # changed since, this would otherwise silently concat mismatched columns
     if set(df.columns) != set(EXPECTED_COLS):
         raise RuntimeError(
             f"{path.name} was built by a different features.py — delete the "
@@ -273,7 +262,7 @@ def _read(path: Path) -> pd.DataFrame:
 
 
 def quality_report(df: pd.DataFrame, n_rebuilt: int = -1) -> int:
-    """All-NaN or constant columns get imputed away silently. Surface them."""
+    """all-NaN or constant columns get silently imputed away later -- catch them here first"""
     problems = 0
     print("\nFEATURE QUALITY")
     for col in F.FEATURE_NAMES:
@@ -289,9 +278,9 @@ def quality_report(df: pd.DataFrame, n_rebuilt: int = -1) -> int:
     if not problems:
         print("  no all-NaN or constant columns")
 
-    # Highest-risk unit regression: a live path that skips the m/s^2 -> g
-    # conversion would put acc_mag_mean near 9.8, not gravity's 1.0, and the
-    # motion gate (calibrated in g) would desynchronise from the real signal.
+    # biggest risk here: if the live m/s^2 -> g conversion got skipped,
+    # acc_mag_mean would sit near 9.8 instead of ~1.0 (gravity), and the
+    # motion gate (calibrated in g) would be totally desynced
     if "acc_mag_mean" in df.columns:
         acc_med = float(df["acc_mag_mean"].median())
         if not (0.5 <= acc_med <= 2.0):

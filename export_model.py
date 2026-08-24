@@ -1,43 +1,43 @@
 """
-export_model.py — fit the final model on all subjects and freeze it for the
-live host.
+export_model.py -- fits the final model on all subjects and freezes it for
+the live host.
 
-Produces models/stress_model.joblib containing the fitted classifier, the
-exact ordered feature list it was trained on, the cohort-level scaling
-fallback, and provenance. Also provides StressModel, the class the live host
-imports to run inference.
+Produces models/stress_model.joblib with the fitted classifier, the ordered
+feature list it was trained on, the cohort-level scaling fallback, and
+provenance. Also has StressModel, the class the live host actually imports
+to run inference.
 
     python export_model.py                       # fit 'device', binary, RF
     python export_model.py --features clean      # research-set variant
     python export_model.py --verify              # load and self-test only
 
-Why an artefact rather than a bare pickle
------------------------------------------
-A pickled estimator carries no record of what its columns MEAN. If the live
-feature module emits columns in a different order, or gains or loses one, a
-bare estimator accepts the array and returns confident nonsense — no error, no
-warning. So the feature list is frozen into the artefact and checked on every
-load and every predict.
+why an artefact and not just a pickle
+--------------------------------------
+a bare pickled estimator has no idea what its columns MEAN. if the live
+feature module ever emits columns in a different order, or gains/loses one,
+a bare estimator just accepts the array and returns confident nonsense --
+no error, no warning. so the feature list gets frozen into the artefact and
+checked on every load and every predict.
 
-The t_start prohibition
------------------------
-t_start scored ~0.96 balanced accuracy alone under LOSO, higher than any
-physiological model. WESAD counterbalances stress/amusement order, but
+the t_start thing
+------------------
+t_start alone scored ~0.96 balanced accuracy under LOSO, higher than any real
+physiological model. WESAD does counterbalance stress/amusement order, but
 unequal block lengths plus the excluded meditation blocks leave ~80% of the
 pooled stress timeline with no non-stress window from any subject, so session
-position still predicts the label (mechanism detailed in
-train_model.diagnose_time_confound). t_start has no meaning at inference:
-live monitoring has no protocol and no session start that predicts anything.
-Asserted at export, at load and at predict.
+position still predicts the label (see train_model.diagnose_time_confound for
+the mechanism). t_start means nothing at inference -- live monitoring has no
+protocol, no session start to key off. asserted at export, at load, and at
+predict.
 
-Standardisation at inference
-----------------------------
-Training-time scaling is per-subject: centred and scaled by the median and IQR
-of that subject's first N_REF_WINDOWS windows. The PROCEDURE transfers to
-deployment; the PARAMETERS do not. A new wearer's reference must come from
-their own first windows of wear. So the artefact exports the procedure plus
-the cohort IQR fallback, and StressModel accumulates a live reference buffer,
-reporting itself not ready until that buffer is full.
+standardisation at inference
+------------------------------
+training-time scaling is per-subject: centred/scaled by the median and IQR of
+that subject's first N_REF_WINDOWS windows. the PROCEDURE carries over to
+deployment, the PARAMETERS don't -- a new wearer's reference has to come from
+their own first windows of wear. so the artefact exports the procedure plus
+the cohort IQR fallback, and StressModel builds up a live reference buffer,
+reporting itself not-ready until it's full.
 """
 
 from __future__ import annotations
@@ -70,14 +70,14 @@ RESULTS_DIR = Path("results")
 
 ARTEFACT_VERSION = 2
 
-# Feature sets that may never be exported: they contain the time probe.
+# feature sets that can never be exported -- they contain the time probe
 FORBIDDEN_SETS = {"time_only"}
 
-# Pipeline constants baked into the feature contract but not captured by
-# FEATURE_NAMES alone — two models with identical column names and different
-# window/rate constants (e.g. a pre- and post-hardware-migration pair) would
-# otherwise load interchangeably and silently disagree. Recorded at export,
-# checked on every load — see assert_provenance_matches().
+# pipeline constants baked into the feature contract but not captured by
+# FEATURE_NAMES alone -- two models with the same column names but different
+# window/rate constants (like a pre- vs post-hardware-migration pair) would
+# otherwise load interchangeably and quietly disagree. recorded at export,
+# checked on every load, see assert_provenance_matches().
 PROVENANCE_KEYS = (
     "bvp_to_hr_out_fs",
     "win_short_hr_s",
@@ -97,15 +97,14 @@ def current_provenance() -> dict:
         "imu_target_fs_hz": F.IMU_TARGET_FS_HZ,
         "imu_range_g": F.IMU_RANGE_G,
         "emulate_e4_quantisation": F.EMULATE_E4_QUANTISATION,
-        "acc_units": "g",  # explicit, so a future unit regression is caught
+        "acc_units": "g",  # spelled out explicitly so a future unit regression gets caught
     }
 
 
 def assert_provenance_matches(bundle_provenance: dict) -> None:
-    """Mismatch between an artefact's frozen constants and the live module's
-    must raise, not warn — the same failure class assert_no_time_feature
-    already exists to prevent, just for window/rate constants instead of
-    column names."""
+    """a mismatch between the artefact's frozen constants and the live
+    module's has to raise, not warn -- same idea as assert_no_time_feature,
+    just for window/rate constants instead of column names."""
     live = current_provenance()
     mismatches = {
         k: (bundle_provenance.get(k), live[k])
@@ -123,7 +122,7 @@ def assert_provenance_matches(bundle_provenance: dict) -> None:
 
 
 def assert_no_time_feature(cols) -> None:
-    """The single most important check in this file. See module docstring."""
+    """the single most important check in this file, see the module docstring."""
     if TIME_COL in cols:
         raise ValueError(
             f"'{TIME_COL}' is present in the feature list. It is a diagnostic "
@@ -139,17 +138,17 @@ def assert_no_time_feature(cols) -> None:
 
 
 # --------------------------------------------------------------------------
-# Reference statistics — the scaling procedure, not its parameters
+# reference stats -- the scaling PROCEDURE, not its parameters
 # --------------------------------------------------------------------------
 
 
 def compute_scale(ref: pd.DataFrame, cohort: pd.Series):
-    """Robust centre and scale: ref IQR -> cohort IQR -> 1.0.
+    """robust centre and scale: ref IQR -> cohort IQR -> 1.0.
 
-    No longer takes a "wider" tier: that required a subject's full window
-    set, which doesn't exist at live warm-up, so training (block-wide) and
-    live (ref-only, wider==ref) silently fit different divisors whenever a
-    reference column had zero IQR. Two tiers only, so both sides match.
+    no longer has a "wider" tier -- that needed a subject's full window set,
+    which doesn't exist yet at live warm-up, so training (block-wide) and
+    live (ref-only) used to silently fit different divisors whenever a
+    reference column had zero IQR. two tiers now, so both sides match.
     """
     centre = ref.median()
     iqr = ref.quantile(0.75) - ref.quantile(0.25)
@@ -159,7 +158,7 @@ def compute_scale(ref: pd.DataFrame, cohort: pd.Series):
 
 
 def training_standardise(df: pd.DataFrame, cols: list, cohort_iqr: pd.Series, n_ref: int):
-    """Apply per-subject scaling to the training table, as at evaluation."""
+    """applies per-subject scaling to the training table, same as at evaluation."""
     out = df.copy()
     for sid, idx in df.groupby("subject").groups.items():
         block = df.loc[idx, cols]
@@ -173,12 +172,12 @@ def training_standardise(df: pd.DataFrame, cols: list, cohort_iqr: pd.Series, n_
 
 
 # --------------------------------------------------------------------------
-# Live inference wrapper
+# live inference wrapper
 # --------------------------------------------------------------------------
 
 
 class StressModel:
-    """Load-and-predict wrapper for the live host.
+    """load-and-predict wrapper for the live host.
 
         m = StressModel.load("models/stress_model.joblib")
         for row in warmup_rows:        # dicts from features.feature_vector
@@ -186,9 +185,9 @@ class StressModel:
         if m.ready:
             label, proba = m.predict(row)
 
-    The reference buffer is per-wearer and per-session. Call reset() when the
-    device comes off or a new user puts it on — a reference built on one
-    person's resting physiology is meaningless for another.
+    reference buffer is per-wearer and per-session. call reset() when the
+    device comes off or a new person puts it on -- a reference built off one
+    person's resting physiology means nothing for someone else.
     """
 
     def __init__(self, bundle: dict):
@@ -222,14 +221,14 @@ class StressModel:
         return m
 
     def _self_test(self) -> None:
-        """Predict on a zero vector to confirm the estimator is functional."""
+        """predicts on a zero vector just to confirm the estimator actually works"""
         x = np.zeros((1, len(self.feature_names)))
         try:
             self.clf.predict(x)
         except Exception as e:  # noqa: BLE001
             raise RuntimeError(f"loaded model failed self-test: {e}") from e
 
-    # -- reference buffer ------------------------------------------------
+    # -- reference buffer --------------------------------------------------
 
     @property
     def ready(self) -> bool:
@@ -240,13 +239,13 @@ class StressModel:
         return len(self._ref_rows)
 
     def reset(self) -> None:
-        """Clear the reference. Call on device removal or user change."""
+        """clears the reference. call this on device removal / user change."""
         self._ref_rows.clear()
         self._centre = None
         self._scale = None
 
     def add_reference(self, row: dict) -> bool:
-        """Add one warm-up window. Returns True once the model is ready."""
+        """adds one warm-up window. returns True once the model is ready."""
         self._ref_rows.append(self._row_to_series(row))
         if len(self._ref_rows) >= self.n_ref_required:
             ref = pd.DataFrame(self._ref_rows)
@@ -255,10 +254,10 @@ class StressModel:
             )
         return self.ready
 
-    # -- prediction ------------------------------------------------------
+    # -- prediction ----------------------------------------------------------
 
     def _row_to_series(self, row: dict) -> pd.Series:
-        """Validate one feature dict against the frozen contract."""
+        """checks one feature dict against the frozen contract"""
         missing = [c for c in self.feature_names if c not in row]
         if missing:
             raise ValueError(
@@ -280,7 +279,7 @@ class StressModel:
         return z.fillna(0.0).to_numpy(dtype=np.float64).reshape(1, -1)
 
     def predict(self, row: dict):
-        """Return (class_name, {class_name: probability})."""
+        """returns (class_name, {class_name: probability})"""
         x = self.transform(row)
         idx = int(self.clf.predict(x)[0])
         proba = {}
@@ -302,15 +301,15 @@ class StressModel:
 
 
 # --------------------------------------------------------------------------
-# Export
+# export
 # --------------------------------------------------------------------------
 
 
 def load_loso_summary(task: str, model: str, feature_set: str, n_ref: int):
-    """Attach the evaluation result to the artefact, if it exists.
+    """attaches the eval result to the artefact, if there is one.
 
-    Uses train_model.result_tag so the filename always matches whatever
-    train_model wrote for the same configuration and buffer size.
+    uses train_model.result_tag so the filename always matches whatever
+    train_model wrote for the same config + buffer size.
     """
     p = RESULTS_DIR / f"{result_tag(task, model, feature_set, 'baseline', n_ref)}_summary.json"
     if not p.is_file():
@@ -370,7 +369,7 @@ def export(
         "loso_balanced_acc": round(loso["balanced_acc_mean"], 4) if loso else None,
         "loso_balanced_acc_sd": round(loso["balanced_acc_sd"], 4) if loso else None,
         "loso_macro_f1": round(loso["macro_f1_mean"], 4) if loso else None,
-        # Recorded so the deployed artefact carries the caveat with it.
+        # keeping this on the artefact so the caveat travels with it wherever it's used
         "evaluation_caveat": (
             "Elapsed session time alone reaches ~0.96 binary balanced "
             "accuracy on WESAD under LOSO: order counterbalancing is "
@@ -406,7 +405,7 @@ def export(
 
 
 def verify(path: Path, cache: Path) -> int:
-    """Load the artefact and run it exactly as the live host would."""
+    """loads the artefact and runs it exactly like the live host would"""
     m = StressModel.load(path)
     print(m.describe())
     print()
@@ -423,7 +422,7 @@ def verify(path: Path, cache: Path) -> int:
         print(f"  {sid} has too few windows to simulate warm-up")
         return 1
 
-    # Refuse to predict before the reference is built.
+    # should refuse to predict before the reference is built
     try:
         m.predict(rows[0])
         print("  FAIL: predicted with an incomplete reference")
@@ -439,7 +438,7 @@ def verify(path: Path, cache: Path) -> int:
     top = ", ".join(f"{k}={v:.2f}" for k, v in sorted(proba.items()))
     print(f"  inference: {label}  ({top})  OK")
 
-    # A missing column must raise, not silently mispredict.
+    # a missing column should raise, not silently mispredict
     broken = dict(rows[m.n_ref_required])
     broken.pop(m.feature_names[0])
     try:
@@ -463,8 +462,8 @@ def main() -> int:
     ap.add_argument(
         "--features",
         choices=sorted(set(FEATURE_SETS) - FORBIDDEN_SETS),
-        # Default is the DEPLOYMENT set — the artefact live_host loads should
-        # be device unless a research variant is asked for explicitly.
+        # default is the DEPLOYMENT set -- live_host should load 'device'
+        # unless a research variant is asked for explicitly
         default="device",
     )
     ap.add_argument("--baseline-n", type=int, default=N_REF_WINDOWS,

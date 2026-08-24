@@ -1,19 +1,20 @@
 """
-diagnose_subjects.py — why do some folds fail while others are near-perfect?
+diagnose_subjects.py -- why do some folds fail and others go near-perfect?
 
-Three explanations produce similar fold tables and need different responses:
+three explanations look similar in the fold table but need totally different
+responses:
 
-  (A) NON-RESPONDER. The subject's EDA does not modulate with arousal.
-      Documented in roughly 10% of people. A FINDING, not a bug, and a real
+  (A) NON-RESPONDER. subject's EDA just doesn't move with arousal. happens
+      in roughly 10% of people apparently. a FINDING, not a bug -- a real
       limitation of any EDA-led wearable.
-  (B) INVERTED RESPONDER. EDA modulates strongly but in the wrong direction —
-      skin conductance FALLS under stress. Also a finding, and a stronger one:
-      it means direction cannot be assumed across wearers.
-  (C) SCALING FAULT. The subject's standardisation reference is degenerate,
-      their features land on a scale the training folds never saw, and the
-      fold is lost to arithmetic rather than physiology. A BUG.
+  (B) INVERTED RESPONDER. EDA moves a lot but the WRONG way -- conductance
+      FALLS under stress. also a finding, and a bigger one: means direction
+      can't be assumed to be the same across wearers.
+  (C) SCALING FAULT. subject's standardisation reference is broken, features
+      land on a scale training never saw, fold is lost to arithmetic not
+      physiology. this one's a BUG.
 
-This script separates them.
+this script tells them apart.
 
     python diagnose_subjects.py
     python diagnose_subjects.py --subjects S14 S3
@@ -30,15 +31,15 @@ import pandas as pd
 import features as F
 from train_model import FEATURE_SETS, N_REF_WINDOWS, TIME_COL, Z_CLIP, load_table, standardise
 
-# Tonic and phasic are separated deliberately: a subject can be flat on one
-# and strong on the other, and that distinction matters physiologically.
+# tonic and phasic checked separately on purpose -- a subject can be flat on
+# one and strong on the other, and that distinction actually matters
 TONIC = ["eda_scl_mean", "eda_scl_sd"]
 PHASIC = ["eda_scr_count", "eda_scr_amp_sum", "eda_range"]
 KEY_EDA = TONIC[:1] + PHASIC
 
 
 def cohens_d(a: np.ndarray, b: np.ndarray) -> float:
-    """Standardised mean difference. |d| < 0.2 is negligible separation."""
+    """standardised mean difference. |d| < 0.2 is basically nothing."""
     a, b = a[np.isfinite(a)], b[np.isfinite(b)]
     if a.size < 2 or b.size < 2:
         return np.nan
@@ -50,15 +51,15 @@ def cohens_d(a: np.ndarray, b: np.ndarray) -> float:
 
 
 def responder_check(df: pd.DataFrame) -> pd.DataFrame:
-    """Per-subject effect size of stress vs non-stress on the EDA features.
+    """per-subject effect size of stress vs non-stress on the EDA features.
 
-    Computed on RAW features — standardisation rescales but does not change
-    separation, and raw is what the report should quote.
+    uses RAW features -- standardising rescales but doesn't change
+    separation, and raw is what the report should actually quote.
 
-    A responder shows positive d on eda_scl_mean and eda_scr_count: level
-    rises and responses become more frequent under sympathetic activation.
-    Sign is kept, not absolute, because a negative d is a different finding
-    from a zero one.
+    a responder shows positive d on eda_scl_mean and eda_scr_count: level
+    goes up and responses get more frequent under sympathetic activation.
+    keeping the sign (not abs) because negative d is a different finding
+    than zero.
     """
     rows = []
     for sid, block in df.groupby("subject"):
@@ -67,7 +68,7 @@ def responder_check(df: pd.DataFrame) -> pd.DataFrame:
         r = {"subject": sid, "n_stress": len(stress), "n_rest": len(rest)}
         for c in KEY_EDA + ["eda_scl_sd"]:
             r[c] = cohens_d(stress[c].to_numpy(), rest[c].to_numpy())
-        # Best phasic separation available, for the tonic/phasic split.
+        # best phasic separation available, for the tonic/phasic split
         r["phasic_best"] = max(
             (r[c] for c in PHASIC if np.isfinite(r[c])), key=abs, default=np.nan
         )
@@ -100,14 +101,14 @@ def responder_check(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def reference_check(df: pd.DataFrame) -> pd.DataFrame:
-    """Health of each subject's standardisation reference.
+    """health check on each subject's standardisation reference.
 
-    Mirrors train_model.standardise: the reference is the first
-    N_REF_WINDOWS ACCEPTED windows in recording order, and the divisor is
-    the IQR, not the SD. A zero IQR falls through the cascade to the
-    subject's whole-recording IQR rather than exploding, so a nonzero count
-    here is informative rather than fatal — but a large one means most of
-    that subject's scaling came from the fallback, not the reference.
+    mirrors train_model.standardise: reference is the first N_REF_WINDOWS
+    ACCEPTED windows in recording order, divisor is IQR not SD. a zero IQR
+    falls through the cascade to the subject's whole-recording IQR instead
+    of exploding, so a nonzero count here is informative rather than fatal
+    -- but a big one means most of that subject's scaling came from the
+    fallback, not the actual reference.
     """
     cols = [c for c in F.FEATURE_NAMES if c in df.columns]
     rows = []
@@ -143,10 +144,10 @@ def reference_check(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def zero_iqr_exposure(df: pd.DataFrame, feature_set: str) -> pd.DataFrame:
-    """Which columns of `feature_set` have zero IQR over each subject's first
-    N_REF_WINDOWS accepted windows — the compute_scale() condition that used
-    to route training and live inference to different fallback tiers before
-    the wider-block tier was removed (export_model.py). One row per subject.
+    """which columns of `feature_set` have zero IQR over each subject's first
+    N_REF_WINDOWS accepted windows -- this used to be the exact condition
+    that routed training and live inference to different fallback tiers,
+    before that tier got removed (see export_model.py). one row per subject.
     """
     cols = [c for c in FEATURE_SETS[feature_set] if c in df.columns]
     rows = []
@@ -189,12 +190,12 @@ def zero_iqr_exposure(df: pd.DataFrame, feature_set: str) -> pd.DataFrame:
 
 
 def magnitude_check(df: pd.DataFrame) -> pd.DataFrame:
-    """Post-standardisation magnitudes per subject.
+    """post-standardisation magnitudes per subject.
 
-    Reports the 99th percentile and the clipped fraction, NOT the max: the
-    max saturates at Z_CLIP for nearly every subject, so an outlier test on
-    it can never fire. A subject reaching magnitudes the other fourteen never
-    produce has been placed somewhere the model has no training data.
+    uses p99 and clipped fraction, NOT max -- max saturates at Z_CLIP for
+    almost everyone so a check on it would never actually fire. a subject
+    reaching magnitudes the other fourteen never hit has landed somewhere
+    the model has no training data.
     """
     std_df = standardise(df, "baseline")
     cols = [c for c in F.FEATURE_NAMES if c in df.columns]

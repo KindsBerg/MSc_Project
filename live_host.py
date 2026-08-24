@@ -1,37 +1,35 @@
 """
-live_host.py — streaming inference engine for the wearable.
+live_host.py -- streaming inference engine for the wearable.
 
-Sits between a sample source and the exported model. Accumulates samples as
-they arrive, closes a 60 s window every WIN_STEP_S seconds, computes the
-feature row through the SAME features.py used in training, and hands it to
-StressModel.
+sits between a sample source and the exported model. buffers samples as they
+come in, closes a 60s window every WIN_STEP_S seconds, runs the feature row
+through the SAME features.py used in training, hands it to StressModel.
 
     python live_host.py --replay S2          # replay a WESAD subject
     python live_host.py --replay S2 --speed 0  # as fast as possible
 
-The source is deliberately abstracted. Replay exercises the entire inference
-path with no hardware attached; a WebSocket source swaps in later without
+source is deliberately abstracted -- replay exercises the whole inference
+path with no hardware attached, a WebSocket source can swap in later without
 touching anything below it.
 
 --------------------------------------------------------------------------
-Two things this file gets right on purpose
+two things I want to make sure I got right here
 --------------------------------------------------------------------------
-WINDOW GEOMETRY MATCHES TRAINING. 60 s EDA window, 5 s step. HR is tiled in
-non-overlapping WIN_SHORT_HR_S (40 s) sub-windows, IMU in WIN_SHORT_IMU_S
-(15 s) sub-windows — they diverged once the SEN0344's real ~0.25 Hz cadence
-was measured. Aggregated at window close. Any divergence here is a silent
-accuracy loss, so the constants come from features.py rather than being
-restated.
+WINDOW GEOMETRY MATCHES TRAINING. 60s EDA window, 5s step. HR tiled in
+non-overlapping 40s sub-windows, IMU in 15s sub-windows -- they split apart
+once the SEN0344's real ~0.25Hz cadence got measured. aggregated at window
+close. any mismatch here is a silent accuracy loss, so the constants come
+straight from features.py instead of getting restated here.
 
-UNIT CONVERSION HAPPENS HERE, NOT IN features.py. The LSM6DS3TR-C reports
-acceleration in m/s^2; every g-scaled threshold in features.py (the motion
-gate in particular) is calibrated in g. See ms2_to_g() / prepare_live_accel()
-below — features.py must only ever see g.
+UNIT CONVERSION HAPPENS HERE, NOT IN features.py. LSM6DS3TR-C reports accel
+in m/s^2, every g-scaled threshold in features.py (the motion gate
+especially) is calibrated in g. see ms2_to_g() / prepare_live_accel() below
+-- features.py must only ever see g.
 
-PARTIAL ROWS ARE LEGAL, MISSING MODEL INPUTS ARE NOT. The eda_only artefact
-needs ten EDA columns and nothing else, so the host must run with no PPG
-attached. Blocks with no data yield NaN; the row is then checked against the
-model's OWN column list, and only a missing or non-finite column the model
+PARTIAL ROWS ARE FINE, MISSING MODEL INPUTS ARE NOT. the eda_only artefact
+only needs the ten EDA columns, so the host has to work with no PPG
+attached. blocks with no data give NaN; the row then gets checked against
+the model's OWN column list, and only a missing/non-finite column the model
 actually uses is an error.
 """
 
@@ -51,10 +49,10 @@ import features as F
 from export_model import StressModel
 
 # --------------------------------------------------------------------------
-# IMU ingest — the only place raw LSM6DS3TR-C output is allowed to become the
-# g-valued, WESAD-rate samples features.py expects. Real hardware sources
-# must go through this; push_acc() itself takes pre-converted g and stays the
-# entry point for sources that already are (WESAD replay).
+# IMU ingest -- the only place raw LSM6DS3TR-C output is allowed to become
+# the g-valued, WESAD-rate samples features.py expects. real hardware
+# sources have to go through this; push_acc() itself takes pre-converted g
+# and stays the entry point for sources that already are (WESAD replay).
 # --------------------------------------------------------------------------
 
 SENSORS_GRAVITY_STANDARD = 9.80665  # m/s^2 per g (Adafruit_Sensor convention)
@@ -63,10 +61,10 @@ LSM6DS3TR_C_NATIVE_ODR_HZ = 104.0   # Adafruit_LSM6DS::_init() library default
 
 @dataclass
 class RawIMUSample:
-    """One reading straight off the LSM6DS3TR-C, before any ingest processing.
+    """one reading straight off the LSM6DS3TR-C, before any ingest processing.
 
-    accel_ms2 is m/s^2 (Adafruit_LSM6DS::_read() scaling); gyro_rads is
-    rad/s. Neither has been unit-converted, decimated, or quantised — that is
+    accel_ms2 is m/s^2 (Adafruit_LSM6DS::_read() scaling), gyro_rads is
+    rad/s. neither is unit-converted, decimated, or quantised yet -- that's
     prepare_live_accel()'s job, not the source's.
     """
 
@@ -76,20 +74,19 @@ class RawIMUSample:
 
 
 def ms2_to_g(acc_ms2: np.ndarray) -> np.ndarray:
-    """Convert LSM6DS3TR-C acceleration from m/s^2 to g."""
+    """converts LSM6DS3TR-C acceleration from m/s^2 to g"""
     return np.asarray(acc_ms2, dtype=np.float64) / SENSORS_GRAVITY_STANDARD
 
 
 def assert_accel_units_g(acc_g: np.ndarray, lo: float = 0.7, hi: float = 1.3) -> None:
-    """Raise unless a still-window's acceleration magnitude sits near 1 g.
+    """raises unless a still-window's acceleration magnitude sits near 1g.
 
-    Guards the highest-risk failure in the SEN0344/LSM6DS3TR-C migration:
-    MOTION_STD_THRESHOLD_G is calibrated in g. If the m/s^2 -> g conversion
-    is silently skipped upstream, the motion gate desynchronises from the
-    live signal and both CROSS features degrade with no error raised. This
-    is a calibration/diagnostic check — call it on a known-still block (e.g.
-    at warm-up), not on arbitrary in-motion data, which will legitimately
-    fail it.
+    guards the highest-risk mistake in the SEN0344/LSM6DS3TR-C migration:
+    MOTION_STD_THRESHOLD_G is calibrated in g. if the m/s^2 -> g conversion
+    ever silently gets skipped upstream, the motion gate desyncs from the
+    real signal and both CROSS features quietly degrade with no error. this
+    is a calibration check -- call it on a known-still block (e.g. warm-up),
+    not on arbitrary in-motion data which will legitimately fail it.
     """
     acc_g = np.asarray(acc_g, dtype=np.float64)
     mag = np.linalg.norm(acc_g, axis=-1) if acc_g.ndim > 1 else np.abs(acc_g)
@@ -103,11 +100,11 @@ def assert_accel_units_g(acc_g: np.ndarray, lo: float = 0.7, hi: float = 1.3) ->
 
 
 def decimate_imu(x: np.ndarray, native_fs: float, target_fs: float) -> np.ndarray:
-    """Polyphase-resample a native-rate IMU block down to target_fs.
+    """polyphase-resamples a native-rate IMU block down to target_fs.
 
-    The LSM6DS3TR-C's 104 Hz default ODR has no integer-stride path to
-    WESAD's 32 Hz (104/32 = 3.25), so this uses resample_poly's exact
-    rational up/down ratio rather than naive stride-slicing.
+    LSM6DS3TR-C's 104Hz default ODR has no clean integer stride down to
+    WESAD's 32Hz (104/32 = 3.25), so uses resample_poly's exact rational
+    ratio instead of naive stride slicing.
     """
     x = np.asarray(x, dtype=np.float64)
     if x.size == 0:
@@ -120,12 +117,12 @@ def decimate_imu(x: np.ndarray, native_fs: float, target_fs: float) -> np.ndarra
 
 
 def quantise_to_e4_grid(acc_g: np.ndarray) -> np.ndarray:
-    """Round acceleration (in g) onto the Empatica E4's 1/64 g grid.
+    """rounds acceleration (g) onto the Empatica E4's 1/64g grid.
 
-    The LSM6DS3TR-C resolves 0.061 mg/LSB at +-2 g; the E4 resolves ~15.6 mg,
-    roughly 250x coarser. During still windows the E4's acc_sd features are
-    quantisation-floored in a way ours are not, so the live signal reads
-    systematically lower than anything in the training distribution.
+    LSM6DS3TR-C resolves 0.061 mg/LSB at +-2g, E4 resolves ~15.6mg -- ~250x
+    coarser. on still windows the E4's acc_sd features are quantisation-
+    floored in a way ours wouldn't be, so live would read systematically
+    lower noise than anything in the training distribution.
     """
     return np.round(acc_g / F.E4_ACC_LSB_G) * F.E4_ACC_LSB_G
 
@@ -135,12 +132,13 @@ def prepare_live_accel(
     native_fs: float = LSM6DS3TR_C_NATIVE_ODR_HZ,
     target_fs: float = F.IMU_TARGET_FS_HZ,
 ) -> np.ndarray:
-    """Full live accelerometer ingest pipeline: m/s^2 -> g -> decimate -> E4 grid.
+    """full live accel ingest: m/s^2 -> g -> decimate -> E4 grid.
 
-    Order matters (see the migration notes on features.py): convert units
-    first, decimate second, quantise last and only if EMULATE_E4_QUANTISATION
-    is set — WESAD training data is already on the E4 grid and must not be
-    quantised a second time, which is why this path is live-only.
+    order matters (see the migration notes on features.py) -- convert units
+    first, decimate second, quantise last and only if
+    EMULATE_E4_QUANTISATION is set. WESAD training data is already on the
+    E4 grid and shouldn't get quantised a second time, which is why this
+    path is live-only.
     """
     acc_g = ms2_to_g(acc_ms2)
     acc_g = decimate_imu(acc_g, native_fs, target_fs)
@@ -150,10 +148,10 @@ def prepare_live_accel(
 
 
 class Stream:
-    """Timestamped ring buffer for one sensor channel.
+    """timestamped ring buffer for one sensor channel.
 
-    Holds a little more than one window so a 60 s slice is always available
-    without unbounded growth. Samples must arrive in time order.
+    holds a bit more than one window so a 60s slice is always available
+    without unbounded growth. samples need to arrive in time order.
     """
 
     def __init__(self, fs: float, span_s: float, width: int = 1):
@@ -172,7 +170,7 @@ class Stream:
             self.v.popleft()
 
     def slice(self, t0: float, t1: float) -> np.ndarray:
-        """Samples with t0 <= t < t1, in arrival order."""
+        """samples with t0 <= t < t1, in arrival order"""
         ts = np.fromiter(self.t, dtype=np.float64)
         if ts.size == 0:
             return np.empty((0, self.width)) if self.width > 1 else np.empty(0)
@@ -189,21 +187,21 @@ class Stream:
 
 
 # --------------------------------------------------------------------------
-# Resting-HR reference. Two paths build it the same way: replay_wesad takes
-# one slice from the pre-loaded recording (train-parity); LiveEngine's
-# hardware path accumulates it incrementally from push_hr, since real
-# hardware has no pre-loaded array to slice. Both use this same span, mask,
-# and mean, so hr_baseline_delta means the same thing on every path that
-# builds it — build_dataset, replay, and live hardware.
+# resting-HR reference. two paths build it the same way: replay_wesad takes
+# one slice straight from the pre-loaded recording (train-parity);
+# LiveEngine's hardware path builds it up incrementally from push_hr, since
+# real hardware has no pre-loaded array to slice. both use the same span,
+# mask, and mean, so hr_baseline_delta means the same thing on every path
+# that builds it -- build_dataset, replay, and live hardware.
 # --------------------------------------------------------------------------
 
 BASELINE_HR_REF_S = 300.0  # matches build_dataset.py's BASELINE_REF_S default
 
 
 def _baseline_hr_from_samples(hr: np.ndarray) -> float | None:
-    """Resting-HR mean over a batch of samples, or None if none are usable.
+    """resting-HR mean over a batch of samples, None if nothing usable.
 
-    Same validity mask as replay_wesad / build_dataset: finite, >20, <220 bpm.
+    same validity mask as replay_wesad / build_dataset: finite, >20, <220 bpm.
     """
     hr = np.asarray(hr, dtype=np.float64)
     valid = hr[np.isfinite(hr) & (hr > 20) & (hr < 220)]
@@ -211,9 +209,9 @@ def _baseline_hr_from_samples(hr: np.ndarray) -> float | None:
 
 
 class LiveEngine:
-    """Accumulates samples, closes windows, produces predictions.
+    """buffers samples, closes windows, produces predictions.
 
-    Feed it with push_eda / push_hr / push_acc, then call step() whenever
+    feed it with push_eda / push_hr / push_acc, then call step() whenever
     time advances. step() returns a result dict at each window close and
     None otherwise.
     """
@@ -222,14 +220,14 @@ class LiveEngine:
         self.model = model
         self.hr_fs = hr_fs
 
-        # One window plus one step of slack, so a slice is never truncated by
-        # eviction happening a fraction early.
+        # one window plus one step of slack, so a slice never gets truncated
+        # by eviction happening a fraction early
         span = F.WIN_EDA_S + F.WIN_STEP_S
         self.eda = Stream(F.EDA_FS, span)
         self.hr = Stream(hr_fs, span)
         self.acc = Stream(F.ACC_FS, span, width=3)
-        # Excluded from the model (WESAD has no gyro) — logged in rad/s for
-        # signal-quality gating only, never fed to feature_vector.
+        # not fed to the model (WESAD has no gyro) -- logged in rad/s just
+        # for signal-quality gating
         self.gyro = Stream(F.IMU_TARGET_FS_HZ, span, width=3)
 
         self.t_origin: float | None = None
@@ -237,18 +235,18 @@ class LiveEngine:
         self.baseline_hr: float | None = None
         self.n_windows = 0
 
-        # Hardware-path resting-HR warm-up (see push_hr / _finalize_baseline_hr).
-        # Unused, and never populated, when the loaded model doesn't need
-        # hr_baseline_delta.
+        # hardware-path resting-HR warm-up (see push_hr / _finalize_baseline_hr).
+        # unused, never populated, when the loaded model doesn't need
+        # hr_baseline_delta
         self._hr_ref_buffer: list[float] = []
         self._hr_ref_finalized = False
 
-        # Which columns the loaded artefact actually needs. Everything else
-        # in the 36-feature row may legitimately be NaN.
+        # which columns the loaded artefact actually needs. everything else
+        # in the row can legitimately be NaN
         self.required = set(model.feature_names)
 
-        # Derived from the loaded bundle's own feature list, not a hardcoded
-        # set name — whatever set was exported, this follows it.
+        # derived from the loaded bundle's own feature list, not a
+        # hardcoded set name -- whatever got exported, this follows it
         self._needs_baseline_hr = "hr_baseline_delta" in self.required
 
     # -- ingest ----------------------------------------------------------
@@ -266,24 +264,23 @@ class LiveEngine:
         self._mark(t)
         self.hr.push(t, bpm)
 
-        # Accumulate toward the resting-HR reference, same span as
-        # replay_wesad's opening slice. self.hr itself can't be used for
-        # this — it's a short ring buffer sized for one window (see Stream),
-        # not BASELINE_HR_REF_S seconds of history — so warm-up needs its
-        # own buffer. Stops
-        # accumulating the moment baseline_hr is set by any path (including
-        # replay's direct call — see set_baseline_hr), so this never
-        # recomputes or overwrites a reference that's already established.
+        # accumulating toward the resting-HR reference, same span as
+        # replay_wesad's opening slice. self.hr can't be used for this --
+        # it's a short ring buffer sized for one window, not
+        # BASELINE_HR_REF_S seconds -- so warm-up needs its own buffer.
+        # stops accumulating the moment baseline_hr gets set by any path
+        # (including replay's direct call, see set_baseline_hr), so this
+        # never recomputes or overwrites an already-established reference.
         if self._needs_baseline_hr and not self._hr_ref_finalized:
             if t - self.t_origin < BASELINE_HR_REF_S:
                 self._hr_ref_buffer.append(bpm)
 
     def push_acc(self, t: float, x: float, y: float, z: float) -> None:
-        """Push one accelerometer sample, already in g at F.ACC_FS.
+        """pushes one accel sample, already in g at F.ACC_FS.
 
-        Entry point for pre-converted sources (WESAD replay). Real hardware
-        must go through push_acc_raw() / prepare_live_accel() first — this
-        method does no unit conversion, decimation, or quantisation.
+        entry point for pre-converted sources (WESAD replay). real hardware
+        needs to go through push_acc_raw() / prepare_live_accel() first --
+        this one does no unit conversion, decimation, or quantisation.
         """
         self._mark(t)
         self.acc.push(t, (x, y, z))
@@ -291,15 +288,16 @@ class LiveEngine:
     def push_acc_raw(
         self, t0: float, acc_ms2_block: np.ndarray, native_fs: float = LSM6DS3TR_C_NATIVE_ODR_HZ
     ) -> None:
-        """Ingest one batch of raw LSM6DS3TR-C samples (m/s^2, native ODR).
+        """ingests one batch of raw LSM6DS3TR-C samples (m/s^2, native ODR).
 
-        Matches the ESP32's batched-packet transport (notes.txt A.2) — and
-        decimation needs a block anyway, since a lone raw sample carries no
-        frequency content to resample. t0 is the first raw sample's timestamp;
-        pushed samples are re-timestamped at the decimated IMU_TARGET_FS_HZ
-        spacing. Runs prepare_live_accel() (unit conversion, decimation,
-        E4-grid quantisation) before buffering. push_acc() stays the entry
-        point for already-converted sources (WESAD replay).
+        matches the ESP32's batched-packet transport (notes.txt A.2) --
+        decimation needs a block anyway since a lone raw sample has no
+        frequency content to resample. t0 is the first raw sample's
+        timestamp; pushed samples get re-timestamped at the decimated
+        IMU_TARGET_FS_HZ spacing. runs prepare_live_accel() (unit
+        conversion, decimation, E4-grid quantisation) before buffering.
+        push_acc() is still the entry point for already-converted sources
+        (WESAD replay).
         """
         acc_ms2_block = np.asarray(acc_ms2_block, dtype=np.float64).reshape(-1, 3)
         acc_g = prepare_live_accel(acc_ms2_block, native_fs=native_fs)
@@ -308,37 +306,34 @@ class LiveEngine:
             self.push_acc(t0 + i * dt_out, *row)
 
     def push_gyro(self, t: float, x_rads: float, y_rads: float, z_rads: float) -> None:
-        """Log a gyro sample (rad/s). Diagnostic only — never enters feature_vector."""
+        """logs a gyro sample (rad/s). diagnostic only, never feeds feature_vector."""
         self._mark(t)
         self.gyro.push(t, (x_rads, y_rads, z_rads))
 
     # -- feature assembly -------------------------------------------------
 
     def _short_blocks(self, t0: float, t1: float):
-        """Tile the window with non-overlapping short sub-windows.
+        """tiles the window with non-overlapping short sub-windows.
 
-        HR (WIN_SHORT_HR_S) and IMU (WIN_SHORT_IMU_S) are tiled separately —
-        they diverged once the SEN0344's real cadence was measured. Identical
-        geometry to build_dataset.build_subject, which is the only reason the
-        live features mean the same thing as the trained ones.
+        HR (40s) and IMU (15s) get tiled separately -- they split apart
+        once the SEN0344's real cadence got measured. same geometry as
+        build_dataset.build_subject, which is the only reason live
+        features mean the same thing as trained ones.
 
-        HR is anchored to window CLOSE (t1), not window start — a still-start
+        HR is anchored to window CLOSE (t1), not start -- a still-start
         anchor left the most recent 20s of the 60s window unused at
-        prediction time, so the HR block was up to 20s stale. The tiling
-        walks backward from t1 in WIN_SHORT_HR_S steps, so the LAST block
-        always ends exactly at t1. With the current constants
-        (WIN_SHORT_HR_S=40, WIN_EDA_S=60) there is exactly one HR block per
-        window, so this loop and the aggregate_short_windows() call on
-        hr_blocks in _row() are a no-op — kept anyway because both are the
-        real code path if either constant changes; do not mistake the
-        single-iteration behaviour for dead code.
+        prediction time, so the HR block was up to 20s stale. tiling walks
+        backward from t1 in 40s steps so the LAST block always ends
+        exactly at t1. with the current constants there's only ever 1 HR
+        block per window so this loop looks like a no-op -- kept anyway
+        because it's the real code path if either constant changes, don't
+        mistake it for dead code.
 
-        imu_blocks_hr_span is the subset of imu_blocks overlapping the HR
-        blocks' span [hr_span_start, hr_span_end) by sub-window midpoint —
-        WIN_SHORT_IMU_S (15s) doesn't evenly divide WIN_SHORT_HR_S (40s), so
-        exact containment isn't possible; midpoint overlap is the standard
-        majority-overlap approximation. Used to scope the hr_delta_x_still
-        cross-term — see features.cross_features().
+        imu_blocks_hr_span = the IMU sub-blocks overlapping the HR blocks'
+        span, by sub-window midpoint -- 15s doesn't evenly divide 40s so
+        exact containment isn't possible, midpoint overlap is the standard
+        approximation. this is what scopes the hr_delta_x_still cross-term,
+        see features.cross_features().
         """
         n_hr_blocks = int((t1 - t0) // F.WIN_SHORT_HR_S)
         hr_blocks = []
@@ -352,7 +347,7 @@ class LiveEngine:
                     F.hr_features(hr_win, self.hr_fs, baseline_hr=self.baseline_hr)
                 )
             s = e
-        hr_span_end = s  # == t1 whenever n_hr_blocks > 0, by construction
+        hr_span_end = s  # == t1 whenever n_hr_blocks > 0
 
         imu_blocks, imu_blocks_hr_span = [], []
         s = t0
@@ -369,7 +364,7 @@ class LiveEngine:
         return hr_blocks, imu_blocks, imu_blocks_hr_span
 
     def _row(self, t0: float, t1: float) -> dict:
-        """One full 36-column row. Absent streams yield NaN, not an error."""
+        """one full feature row. missing streams give NaN, not an error."""
         eda_win = self.eda.slice(t0, t1)
         hr_blocks, imu_blocks, imu_blocks_hr_span = self._short_blocks(t0, t1)
 
@@ -389,11 +384,11 @@ class LiveEngine:
         return {k: row[k] for k in F.FEATURE_NAMES}
 
     def _check_required(self, row: dict) -> list:
-        """Columns the model needs that this row cannot supply.
+        """which columns the model needs that this row can't supply.
 
-        hr_baseline_delta is excluded while its own reference is still
-        pending (see step()) — it's expected to be NaN until baseline_hr is
-        established, and that's a warm-up state, not a missing-data error.
+        hr_baseline_delta gets skipped while its own reference is still
+        pending (see step()) -- expected to be NaN until baseline_hr is
+        set, that's a warm-up state not a missing-data error.
         """
         skip = (
             {"hr_baseline_delta"}
@@ -407,14 +402,14 @@ class LiveEngine:
         ]
 
     def _finalize_baseline_hr(self) -> None:
-        """One-shot: turn the warm-up buffer into baseline_hr.
+        """one-shot: turns the warm-up buffer into baseline_hr.
 
-        Only called once the full BASELINE_HR_REF_S has elapsed (see step()),
-        never on a partial buffer — a short reference is worse than none,
-        since hr_baseline_delta would then mean something different for this
-        session than for the ones it was trained against. If no valid
-        samples survived the mask, baseline_hr stays None and the engine
-        stays not-ready — see set_baseline_hr.
+        only called once the full BASELINE_HR_REF_S has actually elapsed
+        (see step()), never on a partial buffer -- a short reference is
+        worse than none, since hr_baseline_delta would then mean something
+        different for this session than the ones it was trained against.
+        if nothing survived the mask, baseline_hr just stays None and the
+        engine stays not-ready -- see set_baseline_hr.
         """
         self._hr_ref_finalized = True
         baseline = _baseline_hr_from_samples(np.asarray(self._hr_ref_buffer, dtype=np.float64))
@@ -424,7 +419,7 @@ class LiveEngine:
     # -- the loop --------------------------------------------------------
 
     def step(self, now: float):
-        """Close a window if one is due. Returns a result dict or None."""
+        """closes a window if one's due. returns a result dict or None."""
         if self.next_close is None or now < self.next_close:
             return None
 
@@ -449,11 +444,11 @@ class LiveEngine:
                 "detail": f"{len(bad)} required column(s) unusable: {bad[:3]}",
             }
 
-        # Warm-up: two independent references, cannot be inherited from
-        # WESAD subjects — different skin, different baseline.
-        #   model.ready    — EDA standardisation reference (model.add_reference).
-        #   baseline_hr    — the wearer's own resting HR, gated in only when
-        #                    the loaded model's feature set needs it.
+        # warm-up: two independent references, neither inherited from
+        # WESAD subjects -- different skin, different baseline
+        #   model.ready    — EDA standardisation reference (model.add_reference)
+        #   baseline_hr    — wearer's own resting HR, only gated in when the
+        #                    loaded model's feature set needs it
         waiting_on_baseline_hr = self._needs_baseline_hr and self.baseline_hr is None
         if not self.model.ready or waiting_on_baseline_hr:
             if not self.model.ready:
@@ -469,31 +464,32 @@ class LiveEngine:
         return {"t": t1, "state": "ok", "label": label, "proba": proba, "row": row}
 
     def set_baseline_hr(self, bpm: float) -> None:
-        """Resting HR for hr_baseline_delta — required by feature sets that
-        include it (e.g. device), unused otherwise (e.g. eda_only).
+        """resting HR for hr_baseline_delta -- required by feature sets
+        that include it (e.g. device), unused otherwise (e.g. eda_only).
 
-        Marks the warm-up buffer finalized regardless of caller, so whichever
-        path sets this first — replay's direct call or this engine's own
-        hardware-path accumulator — the other never re-triggers or overwrites it.
+        marks the warm-up buffer finalized regardless of caller, so
+        whichever path sets this first -- replay's direct call or this
+        engine's own hardware-path accumulator -- the other never
+        re-triggers or overwrites it.
         """
         self.baseline_hr = float(bpm)
         self._hr_ref_finalized = True
 
 
 # ==========================================================================
-# Sources
+# sources
 # ==========================================================================
 
 
 def replay_wesad(engine: LiveEngine, sid: str, root: str, speed: float = 1.0):
-    """Push one WESAD subject through the engine as if it were arriving live.
+    """pushes one WESAD subject through the engine as if it arrived live.
 
-    This is the integration test for the whole inference path: same feature
-    module, same window geometry, same model, no hardware. If a subject
-    replays to sensible predictions here, the only remaining unknown is the
-    sensors themselves.
+    this is the integration test for the whole inference path: same
+    feature module, same window geometry, same model, no hardware. if a
+    subject replays to sensible predictions here, the only unknown left is
+    the sensors themselves.
 
-    speed=1.0 is real time; speed=0 runs as fast as the CPU allows.
+    speed=1.0 is real time, speed=0 runs as fast as the CPU allows.
     """
     from wesad_loader import WRIST_FS, load_subject
 
@@ -501,10 +497,10 @@ def replay_wesad(engine: LiveEngine, sid: str, root: str, speed: float = 1.0):
     hr_series = F.bvp_to_hr(sub.bvp, fs=WRIST_FS["bvp"], out_fs=engine.hr_fs)
     hr = hr_series.values
 
-    # Resting reference from the opening of the recording, exactly as
-    # build_dataset does — chosen without reference to any label. Same span,
-    # mask, and mean as LiveEngine's hardware-path accumulator — see
-    # BASELINE_HR_REF_S / _baseline_hr_from_samples.
+    # resting reference from the start of the recording, exactly like
+    # build_dataset does -- chosen without looking at any label. same
+    # span, mask, and mean as LiveEngine's hardware-path accumulator, see
+    # BASELINE_HR_REF_S / _baseline_hr_from_samples
     ref = hr[: int(BASELINE_HR_REF_S * engine.hr_fs)]
     baseline = _baseline_hr_from_samples(ref)
     if baseline is not None:
@@ -512,8 +508,8 @@ def replay_wesad(engine: LiveEngine, sid: str, root: str, speed: float = 1.0):
 
     duration = sub.duration()
 
-    # Merge every channel into one time-ordered event list, so the engine
-    # sees the same interleaving a real multi-rate stream would produce.
+    # merge every channel into one time-ordered event list, so the engine
+    # sees the same interleaving a real multi-rate stream would produce
     events = []
     for i, v in enumerate(sub.eda):
         t = i / WRIST_FS["eda"]
@@ -556,7 +552,7 @@ def replay_wesad(engine: LiveEngine, sid: str, root: str, speed: float = 1.0):
 
 
 # ==========================================================================
-# Entry point
+# entry point
 # ==========================================================================
 
 

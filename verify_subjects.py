@@ -1,39 +1,39 @@
 """
-verify_subjects.py — targeted forensics for the two folds that survived every
-fix to the reference-window pipeline.
+verify_subjects.py -- targeted forensics for the two folds that survived
+every fix to the reference-window pipeline.
 
     python verify_subjects.py                       # S2 and S3, device set
     python verify_subjects.py --subjects S2 S3 S17  # add S17
     python verify_subjects.py --features clean      # different feature set
     python verify_subjects.py --n-ref 30 100        # compare two buffer sizes
 
-Two distinct hypotheses are under test, one per subject. They are NOT the same
-failure and should not be reported as one.
+two different hypotheses here, one per subject. NOT the same failure,
+shouldn't get reported as one.
 
-S2 sits at exactly 0.500 balanced accuracy for every N <= 30. Balanced accuracy
-of exactly 0.500 on a two-class problem is the signature of a predictor that
-emitted a single class for the entire fold, not of a model that got half its
-guesses wrong. The candidate causes, in the order this script tests them:
+S2 sits at exactly 0.500 balanced accuracy for every N <= 30. exactly 0.500
+on a 2-class problem is the signature of a predictor that just emitted one
+class for the whole fold, not one that got half its guesses wrong. checking
+these in order:
 
-    (a) degenerate prediction   — one class emitted for every test window
-    (b) scaling collapse        — a near-zero reference IQR inflating z scores
-                                  until the fold sits outside the training
-                                  manifold. This is the S6 failure mode, which
-                                  was fixed once already, so it is worth
-                                  excluding explicitly rather than assuming.
-    (c) no separation           — the subject's stress windows genuinely do not
-                                  differ from their baseline windows
+    (a) degenerate prediction   — one class for every test window
+    (b) scaling collapse        — near-zero reference IQR blows up z scores
+                                  til the fold sits outside the training
+                                  manifold. this is the S6 failure mode
+                                  again, already fixed once, worth ruling
+                                  out explicitly rather than assuming
+    (c) no separation           — subject's stress windows genuinely don't
+                                  differ from baseline
 
-S3 is flat at 0.62-0.70 across a 40x range of N, and earlier forensics gave it
-Cohen's d = 1.01 on SCL. A subject with a large effect size that a cross-subject
-model cannot use is the signature of an inverted or idiosyncratic response, not
-of a scaling problem. The specific thing to look for is SIGN DISAGREEMENT: a
-feature that moves up under stress for the cohort and down for this subject is
-actively misleading to a model trained on everyone else, and no amount of
-reference-window tuning will recover it.
+S3 is flat at 0.62-0.70 across a 40x range of N, and earlier forensics gave
+it Cohen's d = 1.01 on SCL. big effect size that the cross-subject model
+still can't use = signature of an inverted/idiosyncratic response, not a
+scaling problem. specifically looking for SIGN DISAGREEMENT: a feature that
+goes up under stress for the cohort but down for this subject actively
+misleads a model trained on everyone else, and no amount of reference-window
+tuning fixes that.
 
-Reads the cache and reuses train_model's standardisation and fold machinery, so
-it cannot disagree with the sweep about how features were scaled.
+reuses train_model's standardisation and fold code so it can't disagree with
+the sweep about how features got scaled.
 """
 
 from __future__ import annotations
@@ -53,7 +53,7 @@ DEFAULT_SUBJECTS = ["S2", "S3"]
 
 
 def cohens_d(a: np.ndarray, b: np.ndarray) -> float:
-    """Pooled-SD effect size. Sign convention: positive means group a is higher."""
+    """pooled-SD effect size. positive = group a is higher."""
     a = a[np.isfinite(a)]
     b = b[np.isfinite(b)]
     if len(a) < 3 or len(b) < 3:
@@ -66,9 +66,9 @@ def cohens_d(a: np.ndarray, b: np.ndarray) -> float:
 
 
 def class_balance(df: pd.DataFrame, subjects: list, task: str) -> None:
-    """Test-set composition. A fold cannot score above chance on a class it
-    does not contain, and balanced accuracy is undefined in a way that silently
-    reads as 0.500 when one class is absent."""
+    """test-set composition. a fold can't score above chance on a class it
+    doesn't have, and balanced accuracy just silently reads as 0.500 when a
+    class is missing -- worth checking first."""
     print("\n" + "=" * 72)
     print("CLASS BALANCE  (held-out set composition)")
     print("=" * 72)
@@ -92,11 +92,11 @@ def class_balance(df: pd.DataFrame, subjects: list, task: str) -> None:
 
 def prediction_profile(df: pd.DataFrame, subjects: list, task: str,
                        model_kind: str, feature_set: str, seed: int) -> pd.DataFrame:
-    """What the model actually emitted for each target fold.
+    """what the model actually predicted for each target fold.
 
-    Distinguishes 'wrong half the time' from 'emitted one class'. Only the
-    second is a degenerate predictor, and only the second is fixable by
-    changing how the fold is scaled.
+    tells apart "wrong half the time" from "just emitted one class" --
+    only the second is a degenerate predictor, and only the second is
+    fixable by changing how the fold gets scaled.
     """
     cols = T.resolve_features(feature_set, df)
     rows = []
@@ -162,11 +162,11 @@ def prediction_profile(df: pd.DataFrame, subjects: list, task: str,
 
 def scaling_health(raw: pd.DataFrame, subjects: list, n_ref: int,
                    feature_set: str) -> pd.DataFrame:
-    """Reference-block condition and post-standardisation magnitude.
+    """reference-block condition and post-standardisation magnitude.
 
-    A near-zero reference IQR is the divisor that produced the original S6
-    collapse. Checked here per feature, not as a subject-level summary, so a
-    single bad divisor cannot hide behind well-behaved neighbours.
+    a near-zero reference IQR is the exact divisor that caused the original
+    S6 collapse. checked per-feature, not as a subject-level summary, so one
+    bad divisor can't hide behind well-behaved neighbours.
     """
     cols = [c for c in T.FEATURE_SETS[feature_set] if c in raw.columns
             and c != T.TIME_COL]
@@ -220,14 +220,14 @@ def scaling_health(raw: pd.DataFrame, subjects: list, n_ref: int,
 
 def response_direction(raw: pd.DataFrame, subjects: list, feature_set: str,
                        top: int = 12) -> pd.DataFrame:
-    """Per-feature effect size for each subject against the cohort consensus.
+    """per-feature effect size for each subject vs the cohort consensus.
 
-    The load-bearing column is 'sign_agrees'. A feature with a large |d| whose
-    sign opposes the cohort is worse for a cross-subject model than a feature
-    with no effect at all: the model has learned a direction from 14 subjects
-    and this subject moves the other way, so the feature actively drives the
-    prediction wrong. That is the specific pathology a responder with high d
-    and low accuracy would show, and it cannot be fixed by rescaling.
+    the load-bearing column is 'sign_agrees'. a feature with big |d| whose
+    sign fights the cohort is WORSE for a cross-subject model than a
+    feature with no effect at all -- the model learned a direction from 14
+    subjects and this one moves the other way, so the feature actively
+    drives the wrong prediction. that's the specific pattern a high-d,
+    low-accuracy responder would show, and rescaling can't fix it.
     """
     cols = [c for c in T.FEATURE_SETS[feature_set] if c in raw.columns
             and c != T.TIME_COL]
@@ -272,8 +272,8 @@ def response_direction(raw: pd.DataFrame, subjects: list, feature_set: str,
 
         mean_abs = float(tab["abs_d_subject"].mean(skipna=True))
         cohort_mean = float(tab["abs_d_cohort"].mean(skipna=True))
-        # Only count disagreement where the cohort has a direction worth
-        # opposing; a sign flip on a feature nobody responds to is noise.
+        # only count disagreement where the cohort has a direction worth
+        # opposing -- a sign flip on a feature nobody responds to is noise
         meaningful = tab[tab["abs_d_cohort"] > 0.3]
         n_flip = int((~meaningful["sign_agrees"]).sum())
         n_meaningful = int(len(meaningful))
@@ -313,10 +313,10 @@ def response_direction(raw: pd.DataFrame, subjects: list, feature_set: str,
 def stability_across_n(raw: pd.DataFrame, subjects: list, task: str,
                        model_kind: str, feature_set: str, seed: int,
                        n_list: list) -> pd.DataFrame:
-    """Balanced accuracy for the target subjects only, across buffer sizes.
+    """balanced accuracy for just the target subjects, across buffer sizes.
 
-    Cheap because only the target folds are scored, but every fold is still
-    trained, so the numbers match the full sweep exactly.
+    cheap because only the target folds get scored, but every fold still
+    gets trained for real so the numbers match the full sweep exactly.
     """
     rows = []
     print("\n" + "=" * 72)
@@ -354,7 +354,7 @@ def main() -> int:
     ap.add_argument("--subjects", nargs="+", default=DEFAULT_SUBJECTS)
     ap.add_argument("--features", default="device")  # follows the deployment set; was eda_only
     ap.add_argument("--task", default="binary", choices=["binary", "3class"])
-    ap.add_argument("--model", default="rf", choices=["rf"])  # 'hgb' removed — make_model only builds rf, so the old choice crashed
+    ap.add_argument("--model", default="rf", choices=["rf"])  # 'hgb' removed -- make_model only ever built rf, so that choice just crashed
     ap.add_argument("--n-ref", nargs="+", type=int, default=[30, 100])
     ap.add_argument("--cache", default="cache")
     ap.add_argument("--seed", type=int, default=0)
@@ -372,8 +372,8 @@ def main() -> int:
 
     class_balance(raw, args.subjects, args.task)
 
-    # Raw-feature checks first: they do not depend on a buffer size, so if the
-    # answer is here it is the same answer at every N.
+    # raw-feature checks first -- these don't depend on a buffer size, so if
+    # the answer's here it's the same answer at every N
     direction = response_direction(raw, args.subjects, args.features)
 
     scale_frames = []

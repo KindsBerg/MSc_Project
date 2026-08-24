@@ -1,18 +1,19 @@
 """
-validate_migration.py — gate for the SEN0344/LSM6DS3TR-C hardware migration.
+validate_migration.py -- gate for the SEN0344/LSM6DS3TR-C hardware migration.
 
-Checks that the measured-hardware constants (WIN_SHORT_HR_S=40, out_fs=0.25,
+checks that the measured-hardware constants (WIN_SHORT_HR_S=40, out_fs=0.25,
 the LSM6DS3TR-C unit/rate constants) are actually in place, that no stale
-pre-migration cache can be silently reused, that the live ingest path
-converts and rejects units correctly, that a 40 s HR window holds enough
+pre-migration cache can sneak back in, that the live ingest path converts
+and rejects units correctly, that a 40s HR window actually holds enough
 samples to be worth computing sd/slope on, that the two independent
-standardisation implementations agree, and that artefact provenance survives
-an export/reload round trip and is actually checked, not just carried.
+standardisation implementations agree, and that artefact provenance
+survives an export/reload round trip and is actually checked, not just
+carried along for the ride.
 
     python validate_migration.py
 
-Prints one line per check and a single pass/fail summary. Exits non-zero on
-any failure.
+prints one line per check plus a pass/fail summary. exits non-zero on any
+failure.
 """
 
 from __future__ import annotations
@@ -37,12 +38,12 @@ Result = tuple[str, bool, str]
 
 
 # --------------------------------------------------------------------------
-# 1. Constants
+# 1. constants
 # --------------------------------------------------------------------------
 
 
 def check_constants() -> Result:
-    """S2 — a partial migration must fail fast, not silently mix old/new values."""
+    """S2 -- a partial migration should fail fast, not silently mix old and new values"""
     problems = []
 
     if hasattr(F, "WIN_SHORT_S"):
@@ -75,13 +76,13 @@ def check_constants() -> Result:
 
 
 # --------------------------------------------------------------------------
-# 2. Cache invalidation
+# 2. cache invalidation
 # --------------------------------------------------------------------------
 
 
 def check_cache_freshness() -> Result:
-    """S7.2 — parquet caches built under the old windows must never be reused
-    silently. Refuses (fails the check) rather than deleting anything itself."""
+    """S7.2 -- parquet caches built under the old windows should never get
+    silently reused. refuses (fails the check) rather than deleting anything itself."""
     if not CACHE_DIR.is_dir():
         return "cache freshness (S7.2)", True, "no cache/ directory — nothing to invalidate"
 
@@ -120,20 +121,20 @@ def check_cache_freshness() -> Result:
 
 
 # --------------------------------------------------------------------------
-# 3. Unit regression at the live ingest boundary
+# 3. unit regression at the live ingest boundary
 # --------------------------------------------------------------------------
 
 
 def check_unit_regression() -> Result:
-    """S7.3 — a still-hand signal in g must survive live ingest near 1.0, and
-    the same signal mislabelled as m/s^2 must be rejected, not accepted."""
+    """S7.3 -- a still-hand signal in g must survive live ingest near 1.0,
+    and the same signal mislabelled as m/s^2 must get rejected, not accepted."""
     native_fs = 104.0
     n = int(native_fs * 5)  # 5 s block
     rng = np.random.default_rng(0)
     still_hand_g = np.tile([0.0, 0.0, 1.0], (n, 1)) + rng.normal(0.0, 0.01, (n, 3))
 
-    # Correct case: the sensor really outputs m/s^2 — feed the g signal
-    # scaled up, exactly as real hardware would, through the full pipeline.
+    # correct case: sensor really does output m/s^2 -- feed the g signal
+    # scaled up, exactly like real hardware would, through the full pipeline
     still_hand_ms2 = still_hand_g * live_host.SENSORS_GRAVITY_STANDARD
     acc_g_out = live_host.prepare_live_accel(
         still_hand_ms2, native_fs=native_fs, target_fs=F.IMU_TARGET_FS_HZ
@@ -146,10 +147,10 @@ def check_unit_regression() -> Result:
             f"mean|acc| after ingest = {mag.mean():.3f}, expected ~1.0 g",
         )
 
-    # Buggy case: g-valued numbers reach the pipeline mislabelled as m/s^2
-    # (the conversion step skipped upstream). The pipeline's own /9.80665
-    # division then makes the result ~9.8x too small; assert_accel_units_g
-    # must catch that, not silently accept it.
+    # buggy case: g-valued numbers reach the pipeline mislabelled as m/s^2
+    # (conversion step skipped upstream). the pipeline's own /9.80665 then
+    # makes the result ~9.8x too small -- assert_accel_units_g needs to
+    # catch that, not silently accept it
     acc_g_bug = live_host.prepare_live_accel(
         still_hand_g, native_fs=native_fs, target_fs=F.IMU_TARGET_FS_HZ
     )
@@ -177,8 +178,8 @@ def check_unit_regression() -> Result:
 
 
 def check_hr_sample_count() -> Result:
-    """S7.4 — a 40 s HR window at 0.25 Hz must hold enough samples for
-    sd/slope to mean anything."""
+    """S7.4 -- a 40s HR window at 0.25Hz has to hold enough samples for
+    sd/slope to actually mean something."""
     n_samples = F.WIN_SHORT_HR_S * F.SEN0344_HR_FS_HZ
     if n_samples < 9:
         return (
@@ -196,7 +197,7 @@ def check_hr_sample_count() -> Result:
 
 
 # --------------------------------------------------------------------------
-# 5. Standardisation agreement
+# 5. standardisation agreement
 # --------------------------------------------------------------------------
 
 
@@ -208,13 +209,13 @@ def _synthetic_feature_table(
     zero_ref_iqr_col: str | None = None,
     n_ref: int = 40,
 ) -> pd.DataFrame:
-    """Deliberately NOT a nice matrix: log-uniform per-column scales spanning
-    six orders of magnitude (real feature columns span very different natural
-    units — eda_scl_mean in microsiemens vs acc_x_absint in g*s), a sprinkle
-    of NaN (real feature rows do carry NaN, e.g. hr_baseline_delta pre-warm-up),
-    and optionally one column forced to zero variance within the first n_ref
+    """deliberately not a nice matrix: log-uniform per-column scales spanning
+    six orders of magnitude (real columns span very different natural units
+    -- eda_scl_mean in microsiemens vs acc_x_absint in g*s), a sprinkle of
+    NaN (real rows do carry NaN, e.g. hr_baseline_delta pre-warm-up), and
+    optionally one column forced to zero variance within the first n_ref
     rows of subject 0 so the ref-IQR fallback path actually gets exercised
-    rather than silently never firing.
+    instead of silently never firing.
     """
     rng = np.random.default_rng(seed)
     rows = []
@@ -259,11 +260,11 @@ def _bundle_for(cols, cohort_iqr, n_ref) -> export_model.StressModel:
 def _max_diff_for_subject(df, sid, cols, n_ref, scaled_train) -> float:
     cohort_iqr = df[cols].quantile(0.75) - df[cols].quantile(0.25)
     model = _bundle_for(cols, cohort_iqr, n_ref)
-    # Keep df's ORIGINAL index — scaled_train is indexed on it too. A prior
-    # version of this check called .reset_index(drop=True) here, which for
-    # any subject but the first in construction order silently looks up the
-    # WRONG row out of scaled_train (self-aligned by coincidence for subject
-    # 0 only). That was a bug in this test, not in the product.
+    # keeps df's ORIGINAL index -- scaled_train is indexed on it too. an
+    # earlier version of this check called .reset_index(drop=True) here,
+    # which for any subject but the first in construction order silently
+    # looked up the WRONG row out of scaled_train (only self-aligned by
+    # coincidence for subject 0). that was a bug in this test, not the product.
     block = df[df["subject"] == sid].sort_values(TIME_COL)
     for r in block.head(n_ref)[cols].to_dict("records"):
         model.add_reference(r)
@@ -275,24 +276,24 @@ def _max_diff_for_subject(df, sid, cols, n_ref, scaled_train) -> float:
         z_live = model.transform(row.to_dict())[0]
         z_train = scaled_train.loc[idx_label, cols].to_numpy(dtype=np.float64)
         d = np.abs(z_live - z_train)
-        d = d[np.isfinite(d)]  # both sides fillna(0) NaNs identically; skip if both NaN->0 already equal
+        d = d[np.isfinite(d)]  # both sides fillna(0) NaNs the same way, skip if already equal
         if d.size:
             max_diff = max(max_diff, float(np.max(d)))
     return max_diff
 
 
 def check_standardisation_agreement() -> Result:
-    """S7.5 — training_standardise and StressModel.transform both drive
-    compute_scale(). Verifies agreement on realistic data (wide per-column
+    """S7.5 -- training_standardise and StressModel.transform both drive
+    compute_scale(). checks agreement on realistic data (wide per-column
     scales, injected NaN) AND on the zero-ref-IQR case that used to diverge
     (block-wide vs reference-only "wider" tier, measured at 19.47) before
-    that tier was removed from compute_scale — both must now be exact."""
+    that tier got removed from compute_scale — both need to be exact now."""
     n_ref = 40
     cols = list(F.FEATURE_NAMES)
 
-    # Main case: realistic data, every column has nonzero reference IQR
-    # (true for essentially all continuous physiological features in
-    # practice) — this is the path production traffic actually takes.
+    # main case: realistic data, every column has nonzero reference IQR
+    # (true for basically all continuous physiological features in
+    # practice) -- this is the path production traffic actually takes
     df = _synthetic_feature_table(n_subjects=3, n_windows=90, n_ref=n_ref)
     cohort_iqr = df[cols].quantile(0.75) - df[cols].quantile(0.25)
     scaled_train = export_model.training_standardise(df, cols, cohort_iqr, n_ref)
@@ -305,10 +306,10 @@ def check_standardisation_agreement() -> Result:
         return "standardisation agreement (S7.5)", False, str(e)
     main_max = max(main_diffs.values())
 
-    # Former divergence probe: force zero IQR in one column's reference
-    # window for SYN0 — this used to send training to the subject-wide IQR
-    # and live to the reference-only IQR for that column. Now both fall
-    # through to the same cohort_iqr tier, so this must also be exact.
+    # former divergence probe: force zero IQR in one column's reference
+    # window for SYN0 -- used to send training to the subject-wide IQR and
+    # live to the reference-only IQR for that column. now both fall
+    # through to the same cohort_iqr tier, so this needs to be exact too
     probe_col = cols[0]
     df_probe = _synthetic_feature_table(
         n_subjects=3, n_windows=90, n_ref=n_ref, zero_ref_iqr_col=probe_col
@@ -340,7 +341,7 @@ def check_standardisation_agreement() -> Result:
 
 
 class _DummyClassifier:
-    """Minimal stand-in classifier — only .predict is exercised here."""
+    """minimal stand-in classifier -- only .predict gets exercised here"""
 
     classes_ = np.array([0, 1])
 
@@ -349,13 +350,13 @@ class _DummyClassifier:
 
 
 # --------------------------------------------------------------------------
-# 6. Artefact provenance round trip
+# 6. artefact provenance round trip
 # --------------------------------------------------------------------------
 
 
 def check_artefact_provenance_roundtrip() -> Result:
-    """S7.6 — export, reload, and confirm every S6 provenance field survives
-    AND is actually checked (a corrupted field must raise on load)."""
+    """S7.6 -- export, reload, confirm every S6 provenance field survives
+    AND is actually checked (a corrupted field has to raise on load)."""
     import joblib
 
     cols = list(F.FEATURE_NAMES)
@@ -391,7 +392,7 @@ def check_artefact_provenance_roundtrip() -> Result:
                 "provenance dict changed across an export/reload round trip",
             )
 
-        # A corrupted field must raise on load, not warn.
+        # a corrupted field has to raise on load, not warn
         bad_bundle = dict(bundle)
         bad_provenance = dict(provenance)
         bad_provenance["win_short_hr_s"] = 15.0
@@ -418,7 +419,7 @@ def check_artefact_provenance_roundtrip() -> Result:
 
 
 # --------------------------------------------------------------------------
-# Runner
+# runner
 # --------------------------------------------------------------------------
 
 CHECKS = [

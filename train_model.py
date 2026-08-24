@@ -1,28 +1,26 @@
 """
-train_model.py — leave-one-subject-out evaluation on the WESAD feature table.
+train_model.py -- leave-one-subject-out eval on the WESAD feature table.
 
     python train_model.py --diagnose                    # time-confound check
     python train_model.py --features clean --permutation
     python train_model.py --task both --sweep           # the ablation table
 
-Standardisation reference: the first N_REF_WINDOWS ACCEPTED windows per
-subject, not a wall-clock cutoff. A time cutoff gave S6 zero reference
-windows, silently fell back to whole-recording stats for that subject alone,
-and collapsed the fold to 0.500.
+standardisation reference = first N_REF_WINDOWS ACCEPTED windows per subject,
+not a wall-clock cutoff. tried a time cutoff once and it gave S6 zero
+reference windows, which silently fell back to whole-recording stats and
+tanked that fold to 0.500.
 
-N_REF_WINDOWS = 40 was chosen from a sweep over 10-400 windows. Balanced
-accuracy showed no significant dependence on it anywhere in that range
-(best p = 0.074), so the value was selected on worst-case fold performance
-and warm-up latency instead: 40 is the smallest buffer at which no fold
-collapses to a single-class predictor, and it costs 4m15s of warm-up.
-That sweep is finished; its outputs are in results/ref_window_sweep*.csv.
+N_REF_WINDOWS = 40 came from sweeping 10-400 windows -- balanced accuracy
+didn't really depend on it anywhere in that range, so picked based on
+worst-case fold performance and warm-up time instead: 40 is the smallest
+buffer where no fold collapses to predicting one class, costs 4m15s warm-up.
+sweep results are in results/ref_window_sweep*.csv.
 
-Feature-set history: the contract is now 33 features (see features.py).
-'clean' drops the four posture means (29 features); it is NOT the same
-'clean' as the retired 42-feature sweep, preserved in
-results/ablation_sweep_prior_contract.csv. 'device' is the deployable set:
-EDA front end + HR block + acc_mag_mean (15 features; motion_flag excluded —
-see the DEVICE_IMU_FEATURES comment).
+feature contract is 33 features now (see features.py). 'clean' drops the 4
+posture means (29 features) -- NOT the same 'clean' as the old 42-feature
+sweep (that one's in results/ablation_sweep_prior_contract.csv). 'device' is
+the actual deployable set: EDA + HR block + acc_mag_mean (15 features,
+motion_flag dropped -- see DEVICE_IMU_FEATURES below).
 """
 
 from __future__ import annotations
@@ -47,17 +45,17 @@ from sklearn.metrics import (
 import features as F
 
 N_REF_WINDOWS = 40
-Z_CLIP = 20.0  # post-scaling clip; beyond this is a degenerate divisor
+Z_CLIP = 20.0  # clip after scaling -- past this the divisor was basically degenerate
 
 CACHE_DIR = Path("cache")
 RESULTS_DIR = Path("results")
 
 STRESS_LABEL = 2
-CEILINGS = {"binary": 0.88, "3class": 0.76}  # published WESAD all-wrist
+CEILINGS = {"binary": 0.88, "3class": 0.76}  # published WESAD all-wrist numbers
 TIME_COL = "t_start"
 
-# Mean acceleration = gravity projection = posture. Drifts over a long
-# recording, so it correlates with session position.
+# mean acceleration = gravity direction = posture. drifts over a long
+# recording so it ends up correlated with session position
 POSTURE_FEATURES = ["acc_x_mean", "acc_y_mean", "acc_z_mean", "acc_mag_mean"]
 
 
@@ -66,55 +64,45 @@ def _drop(cols, remove) -> list:
     return [c for c in cols if c not in rm]
 
 
-# IMU contribution to `device`: motion magnitude only. motion_flag was
-# removed: it is a binary indicator whose reference-window IQR is zero for
-# 13/15 subjects, so it fell through the divisor cascade to the unit path and
-# entered the matrix untransformed while every other feature was
-# standardised. Removing it moved binary balanced accuracy by +0.003 — well
-# inside the ~+/-0.15 fold spread, i.e. it carried no measurable information
-# (results/ablation_sweep.csv). It stays in features.FEATURE_NAMES — the
-# cache contract is unchanged — it is just not selected here. motion_fraction
-# is likewise not selected: never evaluated in this set, do not add unverified.
+# device's IMU contribution is just motion magnitude. dropped motion_flag --
+# it's a binary flag whose reference-window IQR is zero for 13/15 subjects,
+# so it fell through the scaling cascade unstandardised while everything
+# else got scaled. removing it moved balanced acc by +0.003, basically
+# nothing (results/ablation_sweep.csv). still in features.FEATURE_NAMES,
+# just not picked here. motion_fraction never got evaluated either, not
+# adding it without testing first.
 DEVICE_IMU_FEATURES = ["acc_mag_mean"]
 
-# Everything the deployable hardware can actually produce: the custom EDA
-# front end, the four-feature HR block (see features.py's HR_FEATURES), and
-# minimal IMU motion context. Excluded, and why:
-#   HRV features     — SEN0344 firmware blocks raw BVP FIFO access, so no
-#                       beat-to-beat intervals exist to compute HRV from.
-#   temperature      — the LM75BD on this PCB reads board self-heating, not
-#                       skin temperature; a different instrument entirely.
-#   absolute posture — wrist orientation from WESAD's Empatica placement
-#                       doesn't transfer to this device's wrist mount.
+# everything the actual hardware can produce: EDA front end + the 4-feature
+# HR block + minimal IMU. skipping:
+#   HRV       SEN0344 blocks raw BVP FIFO access, no beat-to-beat intervals
+#   temp      LM75BD reads board self-heating not skin temp, different thing
+#   posture   wrist orientation from WESAD's E4 placement won't transfer to
+#             this device's mount
 DEVICE_FEATURES = list(F.EDA_FEATURES) + list(F.HR_FEATURES) + DEVICE_IMU_FEATURES
 
-# Five sets, each with a distinct job:
-#   all        every feature in the contract; available via --features,
-#              not part of the reported sweep
-#   clean      headline configuration, posture means removed (29 features)
-#   eda_only   the custom EDA front end alone; available via --features for
-#              per-modality ablation, not part of the reported sweep
-#   device     the deployable hardware configuration (15) — see DEVICE_FEATURES
-#   time_only  control, not a result — see sweep_table()
+# 5 sets, each doing something different:
+#   all        every feature, available via --features, not in the sweep
+#   clean      headline config, posture means dropped (29 features)
+#   eda_only   just the EDA front end, for per-modality ablation
+#   device     the actual deployable config (15) -- see DEVICE_FEATURES
+#   time_only  control, not a real result -- see sweep_table()
 FEATURE_SETS = {
     "all": list(F.FEATURE_NAMES),                       # full 33-feature contract
-    "clean": _drop(F.FEATURE_NAMES, POSTURE_FEATURES),  # contract minus the four posture means
+    "clean": _drop(F.FEATURE_NAMES, POSTURE_FEATURES),  # contract minus posture means
     "eda_only": list(F.EDA_FEATURES),                   # the 10 EDA features alone
     "device": DEVICE_FEATURES,                          # EDA + HR + acc_mag_mean
-    "time_only": [TIME_COL],                            # elapsed time — the leakage probe
+    "time_only": [TIME_COL],                            # elapsed time, the leakage probe
 }
 
-SWEEP_ORDER = ["clean", "device", "time_only"]  # the reported rows, identical folds and seed
+SWEEP_ORDER = ["clean", "device", "time_only"]  # the rows actually reported, same folds/seed
 
 
 def load_table(cache_dir: Path) -> pd.DataFrame:
-    """Load the feature cache, pinned to features.py's current pipeline version.
+    """loads the feature cache, pinned to features.py's current pipeline version.
 
-    Filenames are derived from FEATURE_PIPELINE_VERSION rather than hardcoded
-    here, so build_dataset.py (which writes them) and this loader can't drift
-    apart. Deliberately not permissive: a cache built under an older version
-    won't match and won't be silently substituted — see FEATURE_PIPELINE_VERSION
-    in features.py for why that matters.
+    names come from FEATURE_PIPELINE_VERSION so this can't drift from what
+    build_dataset.py wrote -- an older cache just won't match, on purpose.
     """
     version = F.FEATURE_PIPELINE_VERSION
     for name in (f"wesad_features_v{version}.parquet", f"wesad_features_v{version}.csv.gz"):
@@ -141,18 +129,16 @@ def load_table(cache_dir: Path) -> pd.DataFrame:
 
 
 def load_baseline_ref_s(cache_dir: Path) -> float | None:
-    """Read the HR-baseline reference window baked into this feature cache.
+    """reads the HR-baseline reference window baked into the cache.
 
-    hr_baseline_delta is computed at build time and does NOT shrink with
-    N_REF_WINDOWS, so it sets its own floor on device warm-up for any feature
-    set touching the HR block. Returns None for a cache built before this
-    metadata existed — treat that as unknown, not zero.
+    this is set at BUILD time and doesn't shrink with N_REF_WINDOWS, so it's
+    its own floor on warm-up for anything using the HR block. None means the
+    cache predates this metadata -- treat as unknown, not zero.
     """
-    # Meta sidecars carry the pipeline version, same as the caches they
-    # describe (build_dataset writes wesad_features_v2.meta.json). The
-    # unversioned names previously looked up here matched nothing built by
-    # the current pipeline, so stale sidecars from an older build — or
-    # nothing at all — answered for the current cache.
+    # meta sidecars are versioned the same as the caches (build_dataset
+    # writes wesad_features_v2.meta.json) -- used to look up an unversioned
+    # name here which just matched a stale file from an older build, or
+    # nothing at all. fixed to use the versioned name.
     v = F.FEATURE_PIPELINE_VERSION
     combined_meta = cache_dir / f"wesad_features_v{v}.meta.json"
     if combined_meta.is_file():
@@ -179,21 +165,19 @@ def make_target(df: pd.DataFrame, task: str):
 
 
 def diagnose_time_confound(df: pd.DataFrame, top: int = 15) -> pd.DataFrame:
-    """Per-subject correlation of each feature with elapsed recording time.
+    """per-subject correlation of each feature with elapsed recording time.
 
-    Distinguishes 'the model reads a clock' from 'the model reads physiology'.
-    |r| > 0.8 is a strong clock; 0.5-0.8 warrants comment.
+    this is what tells "the model reads a clock" apart from "the model reads
+    physiology". |r| > 0.8 = strong clock, 0.5-0.8 worth a comment.
 
-    Mechanism, verified against the per-subject quest files: WESAD DOES
-    counterbalance stress/amusement order (8 amusement-first, 7 stress-first),
-    but counterbalancing does not neutralise session position. The stress
-    block (~10 min labelled) is ~2x the amusement block (~5.5 min), an
-    unlabelled TSST prep delays labelled stress onset, and the meditation
-    blocks excluded by the 3-class scope occupy exactly the intervals where
-    the opposite order-group would provide counter-evidence. Pooled across
-    subjects, stress occupies a ~31-70 min corridor of which ~80% contains no
-    non-stress window from any subject — which is why elapsed time alone
-    reaches ~0.96 binary balanced accuracy under LOSO.
+    checked this against the per-subject quest files: WESAD does
+    counterbalance stress/amusement order, but that doesn't kill the session
+    position effect -- the stress block is ~2x longer than amusement, there's
+    an unlabelled TSST prep before it, and the excluded meditation blocks eat
+    up exactly the intervals that would give counter-evidence. pooled across
+    subjects, most of the stress timeline has no non-stress window from ANY
+    subject -- that's why elapsed time alone hits ~0.96 binary balanced
+    accuracy under LOSO.
     """
     cols = [c for c in F.FEATURE_NAMES if c in df.columns]
     per_subject = {}
@@ -251,35 +235,35 @@ def diagnose_time_confound(df: pd.DataFrame, top: int = 15) -> pd.DataFrame:
 
 
 # --------------------------------------------------------------------------
-# Standardisation
+# standardisation
 # --------------------------------------------------------------------------
 
 
 def _standardise_core(
     df: pd.DataFrame, mode: str, n_ref: int = N_REF_WINDOWS
 ) -> tuple[pd.DataFrame, pd.DataFrame | None]:
-    """Per-subject robust scaling. Never uses labels.
+    """per-subject robust scaling. never touches labels.
 
-    Median and IQR, not mean and SD: a near-zero SD divisor on a short
-    reference window produced z-scores in the hundreds. The divisor cascade is
-    reference IQR -> subject IQR -> cohort IQR; a fixed floor was tried and
-    pushed median max|z| from 34 to 2951.
+    uses median/IQR not mean/SD -- a near-zero SD divisor on a short
+    reference window was producing z-scores in the hundreds. cascade is
+    reference IQR -> subject IQR -> cohort IQR; tried a fixed floor instead
+    once and it made things worse (median max|z| went from 34 to 2951).
 
-    Too few reference windows is a hard error — a silent per-subject fallback
-    is what invalidated S6's fold.
+    too few reference windows is a hard error now -- a silent per-subject
+    fallback is exactly what broke S6's fold before.
 
-    t_start is left unscaled; it is a probe input.
+    t_start stays unscaled, it's just a probe input.
 
-    Returns (scaled_df, fallback_table). fallback_table is a subject x feature
-    frame of which cascade level set the divisor, or None for mode="none".
+    returns (scaled_df, fallback_table) -- fallback_table says which cascade
+    level set the divisor for each subject/feature, None if mode="none".
     """
     if mode == "none":
         return df, None
 
-    out = df.copy()  # scaled copy; the caller's frame is left untouched
-    cols = [c for c in F.FEATURE_NAMES if c in df.columns]  # only contract columns are scaled
-    cohort_iqr = df[cols].quantile(0.75) - df[cols].quantile(0.25)  # last-resort divisor, pooled over everyone
-    fallback_rows = []  # per subject: which cascade level each feature's divisor came from
+    out = df.copy()  # working copy, leave the caller's df alone
+    cols = [c for c in F.FEATURE_NAMES if c in df.columns]  # only scale contract columns
+    cohort_iqr = df[cols].quantile(0.75) - df[cols].quantile(0.25)  # last resort, pooled over everyone
+    fallback_rows = []  # which cascade level each feature's divisor came from, per subject
 
     for sid, idx in df.groupby("subject").groups.items():
         block = df.loc[idx, cols]
@@ -288,7 +272,7 @@ def _standardise_core(
             if len(ref) < 5:
                 raise ValueError(f"{sid}: only {len(ref)} reference windows")
         elif mode == "subject":
-            ref = block  # transductive; comparison only
+            ref = block  # transductive, just for comparison
         else:
             raise ValueError(f"unknown standardise mode: {mode}")
 
@@ -296,9 +280,8 @@ def _standardise_core(
         iqr = ref.quantile(0.75) - ref.quantile(0.25)
         subj_iqr = block.quantile(0.75) - block.quantile(0.25)
 
-        # Mirror the exact selection the scale computation below makes, so the
-        # level recorded is never out of step with the divisor actually used
-        # (NaN compares False either direction, same as .where).
+        # mirrors exactly what the scale computation below picks, so this
+        # never gets out of sync with what divisor actually got used
         used_ref = iqr > 0
         used_subj = (~used_ref) & (subj_iqr > 0)
         used_cohort = (~used_ref) & (~used_subj) & (cohort_iqr > 0)
@@ -308,11 +291,11 @@ def _standardise_core(
         level[(~used_ref) & (~used_subj) & (~used_cohort)] = "unit"
         fallback_rows.append(pd.Series(level, name=sid))
 
-        scale = iqr.where(iqr > 0, subj_iqr).where(lambda s: s > 0, cohort_iqr)  # cascade: reference -> subject -> cohort
-        scale = scale.where(scale > 0, 1.0)  # unit divisor only if every level was degenerate
-        out.loc[idx, cols] = ((block - centre) / scale).to_numpy()  # robust z-score for this subject's rows
+        scale = iqr.where(iqr > 0, subj_iqr).where(lambda s: s > 0, cohort_iqr)  # cascade: ref -> subject -> cohort
+        scale = scale.where(scale > 0, 1.0)  # only unit divisor if literally everything was degenerate
+        out.loc[idx, cols] = ((block - centre) / scale).to_numpy()  # robust z-score
 
-    out[cols] = out[cols].clip(-Z_CLIP, Z_CLIP).fillna(0.0)  # bound degenerate divisors, then NaN -> 0
+    out[cols] = out[cols].clip(-Z_CLIP, Z_CLIP).fillna(0.0)  # clip degenerate divisors, NaN -> 0
     return out, pd.DataFrame(fallback_rows)
 
 
@@ -321,12 +304,12 @@ def standardise(df: pd.DataFrame, mode: str, n_ref: int = N_REF_WINDOWS) -> pd.D
 
 
 def fallback_report(fallback_table: pd.DataFrame | None) -> None:
-    """How often each feature borrowed scale from the subject or cohort rather
-    than its own reference block.
+    """how often each feature had to borrow scale from the subject/cohort
+    level instead of its own reference block.
 
-    Binary and near-zero-variance features fall through on most subjects,
-    which means those columns are not really being standardised per subject at
-    all. Worth seeing next to the accuracy it affects.
+    binary and near-zero-variance features fall through a lot, meaning
+    they're not really being standardised per-subject at all -- worth
+    knowing next to whatever accuracy it affects.
     """
     if fallback_table is None or fallback_table.empty:
         return
@@ -350,12 +333,12 @@ def fallback_report(fallback_table: pd.DataFrame | None) -> None:
 
 
 def scale_report(std_df: pd.DataFrame) -> None:
-    """Post-standardisation magnitude check across subjects.
+    """post-standardisation magnitude check across subjects.
 
-    Reports the 99th percentile, not the max: max saturates at Z_CLIP for
-    every subject, so an outlier check on it could never fire. One subject
-    reaching magnitudes the others never produce means that fold is lost to
-    scaling rather than physiology — the S6 failure mode.
+    uses p99, not max -- max just saturates at Z_CLIP for everyone so an
+    outlier check on it would never fire. one subject sitting way outside
+    everyone else's range means that fold is lost to scaling, not
+    physiology -- the S6 failure mode.
     """
     cols = [c for c in F.FEATURE_NAMES if c in std_df.columns]
     rows = []
@@ -381,7 +364,7 @@ def scale_report(std_df: pd.DataFrame) -> None:
 
 
 # --------------------------------------------------------------------------
-# Model and evaluation
+# model + evaluation
 # --------------------------------------------------------------------------
 
 
@@ -407,10 +390,10 @@ def resolve_features(name: str, df: pd.DataFrame) -> list:
 
 
 def _loso_folds(df, cols, task, model_kind, seed, do_permutation, verbose):
-    """Yield one trained fold at a time.
+    """yields one trained fold at a time.
 
-    Split out so a caller can score the same predictions under more than one
-    evaluation mask without retraining. Used by verify_subjects.py.
+    split out so a caller can re-score the same predictions under a
+    different mask without retraining -- used by verify_subjects.py.
     """
     X_all = df[cols].to_numpy(dtype=np.float64)
     y_all, class_names = make_target(df, task)
@@ -419,7 +402,7 @@ def _loso_folds(df, cols, task, model_kind, seed, do_permutation, verbose):
     for held in sorted(pd.unique(subjects)):
         te = subjects == held
         tr = ~te
-        # Silent when it happens, so assert every fold.
+        # this would fail silently if it ever happened, so assert every fold
         assert held not in set(subjects[tr]), "subject leaked across folds"
 
         y_tr, y_te = y_all[tr], y_all[te]
@@ -468,8 +451,8 @@ def run_loso(
     do_permutation: bool = False,
     verbose: bool = True,
 ):
-    """One leave-one-subject-out sweep. Fold order and seed are fixed, so
-    feature sets are compared over identical folds rather than fold noise."""
+    """one full LOSO sweep. fold order + seed are fixed so different feature
+    sets get compared on identical folds, not just fold noise."""
     cols = resolve_features(feature_set, df)
 
     fold_rows, y_true_all, y_pred_all, importances = [], [], [], []
@@ -531,7 +514,7 @@ def run_loso(
 
 
 # --------------------------------------------------------------------------
-# Reporting
+# reporting
 # --------------------------------------------------------------------------
 
 
@@ -552,8 +535,8 @@ def report(summary, evald, folds, imp_df):
         f"{summary['best_fold_macro_f1']:.3f} macro F1"
     )
 
-    # Near-perfect on some subjects and at chance on others is the signature
-    # of a deterministic separator rather than graded physiology.
+    # near-perfect on some subjects and at-chance on others smells like a
+    # deterministic separator, not graded physiology
     near_perfect = int((folds["macro_f1"] > 0.97).sum())
     at_chance = int((folds["balanced_acc"] < 0.55).sum())
     if near_perfect and at_chance:
@@ -615,9 +598,9 @@ def save(tag: str, folds, summary, imp_df, evald):
 
 
 def result_tag(task: str, model: str, feature_set: str, mode: str, n_ref: int) -> str:
-    """Result filename stem. n_ref is always included so runs at different
-    buffer sizes never overwrite each other — including the ones already in
-    results/ from earlier sweeps."""
+    """builds the result filename stem. n_ref is always in there so
+    different buffer sizes don't overwrite each other, including old
+    sweeps already sitting in results/."""
     return f"{task}_{model}_{feature_set}_{mode}_n{n_ref}"
 
 
@@ -661,7 +644,7 @@ def sweep_table(rows: list) -> None:
 
 
 # --------------------------------------------------------------------------
-# Entry point
+# entry point
 # --------------------------------------------------------------------------
 
 
@@ -706,8 +689,8 @@ def main() -> int:
         print("HR baseline reference: UNKNOWN — cache predates the metadata; "
               "rebuild with --force")
 
-    # The diagnostic runs on RAW features: standardising rescales but does not
-    # decorrelate, and raw is what the report should quote.
+    # diagnostic runs on RAW features -- standardising rescales but doesn't
+    # decorrelate, and raw is what the report should actually quote
     if args.diagnose:
         diagnose_time_confound(df)
         return 0
