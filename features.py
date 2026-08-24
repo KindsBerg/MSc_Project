@@ -108,20 +108,22 @@ ACC_BAND_HZ = (0.3, 10.0)
 # cvxEDA occasionally fails to converge on a short window and falls back to a
 # median-filter decomposition. The fallback rate belongs in the report, so it
 # is counted rather than lost. reset_stats() at the start of a batch run.
-#STATS purpose is to define a dictionary that holds stats about EDA processing.
+# Run-wide counters for EDA processing health. cvxEDA (Greco et al.) is the
+# convex-optimisation tonic/phasic decomposition; when it fails to converge,
+# the median-filter fallback decomposes instead, and the report needs that rate.
 STATS = {
-    "eda_windows": 0, # number of EDA windows processed
-    "cvxeda_ok": 0, # cvxeda stands for convex optimization EDA. ok means they succeeded. convex optimiation is a method for decomposing EDA signals into tonic and phasic components.
-    "cvxeda_fallback": 0, # convex optimization eda num failed
+    "eda_windows": 0,       # EDA windows processed
+    "cvxeda_ok": 0,         # windows where cvxEDA converged
+    "cvxeda_fallback": 0,   # windows decomposed by the median-filter fallback
     "cvxeda_error": None,   # first fallback reason only
-    "scr_windows": 0, # scr means skin conductance response, this holds the num of scr windows processed
-    "scr_fallback": 0, #similar, scr fallback / failure count
-    "scr_error": None, #this is scr error reason.
+    "scr_windows": 0,       # windows through SCR peak detection
+    "scr_fallback": 0,      # windows where NeuroKit2 peaks failed -> scipy find_peaks
+    "scr_error": None,      # first SCR fallback reason only
 }
 
-#reset_stats purpose is to set initial dictionary value for STATS dict.
+
 def reset_stats() -> None:
-    for k in STATS:
+    for k in STATS:  # zero the counters, clear the error strings
         STATS[k] = None if k.endswith("_error") else 0
 
 
@@ -166,7 +168,7 @@ CROSS_FEATURES = [
     "eda_range_gated",    # eda_range * (1 - motion_fraction)
 ]
 
-FEATURE_NAMES: list[str] = EDA_FEATURES + HR_FEATURES + IMU_FEATURES + CROSS_FEATURES # combining all features into one list
+FEATURE_NAMES: list[str] = EDA_FEATURES + HR_FEATURES + IMU_FEATURES + CROSS_FEATURES  # the contract: 33 names, in this order
 N_FEATURES = len(FEATURE_NAMES)
 
 assert len(set(FEATURE_NAMES)) == N_FEATURES, "duplicate name in FEATURE_NAMES"
@@ -176,7 +178,6 @@ assert len(set(FEATURE_NAMES)) == N_FEATURES, "duplicate name in FEATURE_NAMES"
 # Helpers
 # --------------------------------------------------------------------------
 
-#ndarray is an n-dimensional array.
 def _slope(x: np.ndarray, fs: float, t: np.ndarray | None = None) -> float:
     """Least-squares slope in units per second. NaN under two samples.
 
@@ -187,34 +188,33 @@ def _slope(x: np.ndarray, fs: float, t: np.ndarray | None = None) -> float:
     x = np.asarray(x, dtype=np.float64)
     n = x.size
     if n < 2:
-        return np.nan # returns NaN if less than 2 samples, slope undefined
-    t = np.arange(n, dtype=np.float64) / fs if t is None else np.asarray(t, dtype=np.float64) # divides entire value of x / sample time.
-    return float(np.polyfit(t, x, 1)[0]) # returns the slope of lin aggression line fit to the data.
+        return np.nan  # slope is undefined under two samples
+    t = np.arange(n, dtype=np.float64) / fs if t is None else np.asarray(t, dtype=np.float64)  # time axis in seconds; caller-supplied when samples were dropped
+    return float(np.polyfit(t, x, 1)[0])  # slope of the degree-1 least-squares fit, units per second
 
 
 
 def _abs_integral(x: np.ndarray, fs: float) -> float:
     """Integral of |x| over the window, in signal-units x seconds."""
-    x = np.asarray(x, dtype=np.float64) # evenly spaced samples. integral can be approximated.
-    return float(np.sum(np.abs(x)) / fs) if x.size else np.nan #returns the sum of no.abs(x) / fs. which is the integral of the abs val of x / fs.
+    x = np.asarray(x, dtype=np.float64)  # evenly spaced samples, so the integral is a scaled sum
+    return float(np.sum(np.abs(x)) / fs) if x.size else np.nan  # sum(|x|) * dt, with dt = 1/fs
 
 
 def _peak_freq(x: np.ndarray, fs: float, band=ACC_BAND_HZ) -> float:
     """Dominant in-band frequency via periodogram. NaN if the window is short."""
     x = np.asarray(x, dtype=np.float64)
     if x.size < 8:
-        return np.nan # too few samples.
-    x = x - x.mean() # this gives the distance of x to the mean of x. removes DC componnent of signal.
+        return np.nan  # too few samples for a meaningful spectrum
+    x = x - x.mean()  # remove the DC component so 0 Hz cannot win the peak
     if not np.any(x):
         return 0.0
-    f, p = sps.periodogram(x, fs=fs, scaling="density") # this gives spectral density of x in terms of frequency and power (f and p.)
-    sel = (f >= band[0]) & (f <= band[1]) # sel is the bool array that selects frequencies in the band.
-    return float(f[sel][int(np.argmax(p[sel]))]) if sel.any() else np.nan # returns frequencies in band, index of max power in the band.#argmax returns index of max value in array. if no values in band, return NaN.
+    f, p = sps.periodogram(x, fs=fs, scaling="density")  # f = frequency bins, p = power spectral density
+    sel = (f >= band[0]) & (f <= band[1])  # boolean mask restricting to the human-movement band
+    return float(f[sel][int(np.argmax(p[sel]))]) if sel.any() else np.nan  # frequency of the highest in-band power
 
 
 def _nan_block(names: list[str]) -> dict:
-    return {k: np.nan for k in names}
-#purpose of this function is to return a dict of keys and values as NaN.
+    return {k: np.nan for k in names}  # one NaN per requested feature — the "no usable data" row
 
 # --------------------------------------------------------------------------
 # EDA block — 60 s window
@@ -281,8 +281,8 @@ def _find_scrs(phasic: np.ndarray, fs: float):
 
 def eda_features(eda: np.ndarray, fs: float = EDA_FS) -> dict:
     """Ten EDA features over one 60 s window. Input in microsiemens."""
-    eda = np.asarray(eda, dtype=np.float64).reshape(-1) # turns2d np array to float-64 1d arrray
-    if eda.size < int(fs * 5):  # under 5 s is not usable
+    eda = np.asarray(eda, dtype=np.float64).reshape(-1)  # coerce to a flat float64 array
+    if eda.size < int(fs * 5):  # under 5 s of signal is not usable
         return _nan_block(EDA_FEATURES)
 
     tonic, phasic, used_cvxeda = _decompose_eda(eda, fs)
@@ -325,12 +325,12 @@ def hr_features(hr: np.ndarray, fs: float, baseline_hr: float | None = None) -> 
 
     Contains no HRV, by design. See module docstring.
     """
-    hr = np.asarray(hr, dtype=np.float64).reshape(-1)
-    valid = np.isfinite(hr) & (hr > 20.0) & (hr < 220.0)  # drop implausible
-    t = np.arange(hr.size, dtype=np.float64) / fs
-    t, hr = t[valid], hr[valid]
+    hr = np.asarray(hr, dtype=np.float64).reshape(-1)  # flat float64 bpm series
+    valid = np.isfinite(hr) & (hr > 20.0) & (hr < 220.0)  # drop physiologically implausible values
+    t = np.arange(hr.size, dtype=np.float64) / fs  # time axis built BEFORE filtering, so gaps stay real
+    t, hr = t[valid], hr[valid]  # keep time and value aligned through the filter
     if hr.size == 0:
-        return _nan_block(HR_FEATURES)
+        return _nan_block(HR_FEATURES)  # nothing plausible in the window
 
     mean = float(np.mean(hr))
     return {
@@ -352,12 +352,12 @@ def imu_features(acc: np.ndarray, fs: float = ACC_FS) -> dict:
     if acc.ndim != 2 or acc.shape[1] != 3 or acc.shape[0] < 4:
         return _nan_block(IMU_FEATURES)
 
-    mag = np.linalg.norm(acc, axis=1) # mag is the magnitude of acc vector, sqrt root of (x^2 + y^2 + z^2).
+    mag = np.linalg.norm(acc, axis=1)  # 3-D magnitude, sqrt(x^2 + y^2 + z^2), per sample
     out: dict = {}
     for i, ax in enumerate("xyz"):
         out[f"acc_{ax}_mean"] = float(np.mean(acc[:, i]))
         out[f"acc_{ax}_sd"] = float(np.std(acc[:, i]))
-        out[f"acc_{ax}_absint"] = _abs_integral(acc[:, i] - np.mean(acc[:, i]), fs) #abs_int means the integral of absolute value of signal in the window
+        out[f"acc_{ax}_absint"] = _abs_integral(acc[:, i] - np.mean(acc[:, i]), fs)  # movement quantity: integral of |demeaned signal|
         out[f"acc_{ax}_peakfreq"] = _peak_freq(acc[:, i], fs)
 
     out["acc_mag_mean"] = float(np.mean(mag))
@@ -541,11 +541,8 @@ def bvp_to_hr(
     return HRSeries(smoothed[step - 1 : n_out * step : step], out_fs)
 
 
-"""
-main function prints the number of features and their names. for loop through feature names.
-"""
-
 if __name__ == "__main__":
+    # Run directly to print the frozen contract — index and name, in order.
     print(f"{N_FEATURES} features")
     for i, n in enumerate(FEATURE_NAMES):
         print(f"{i:3d}  {n}")

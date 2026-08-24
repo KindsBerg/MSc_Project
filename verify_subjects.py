@@ -2,7 +2,7 @@
 verify_subjects.py — targeted forensics for the two folds that survived every
 fix to the reference-window pipeline.
 
-    python verify_subjects.py                       # S2 and S3, eda_only
+    python verify_subjects.py                       # S2 and S3, device set
     python verify_subjects.py --subjects S2 S3 S17  # add S17
     python verify_subjects.py --features clean      # different feature set
     python verify_subjects.py --n-ref 30 100        # compare two buffer sizes
@@ -352,9 +352,9 @@ def stability_across_n(raw: pd.DataFrame, subjects: list, task: str,
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--subjects", nargs="+", default=DEFAULT_SUBJECTS)
-    ap.add_argument("--features", default="eda_only")
+    ap.add_argument("--features", default="device")  # follows the deployment set; was eda_only
     ap.add_argument("--task", default="binary", choices=["binary", "3class"])
-    ap.add_argument("--model", default="rf", choices=["rf", "hgb"])
+    ap.add_argument("--model", default="rf", choices=["rf"])  # 'hgb' removed — make_model only builds rf, so the old choice crashed
     ap.add_argument("--n-ref", nargs="+", type=int, default=[30, 100])
     ap.add_argument("--cache", default="cache")
     ap.add_argument("--seed", type=int, default=0)

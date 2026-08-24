@@ -17,9 +17,12 @@ and warm-up latency instead: 40 is the smallest buffer at which no fold
 collapses to a single-class predictor, and it costs 4m15s of warm-up.
 That sweep is finished; its outputs are in results/ref_window_sweep*.csv.
 
-'clean' under the 36-feature contract drops the posture means only; it is NOT
-the same 'clean' as the 42-feature sweep. The old sweep is preserved in
-results/ablation_sweep_prior_contract.csv.
+Feature-set history: the contract is now 33 features (see features.py).
+'clean' drops the four posture means (29 features); it is NOT the same
+'clean' as the retired 42-feature sweep, preserved in
+results/ablation_sweep_prior_contract.csv. 'device' is the deployable set:
+EDA front end + HR block + acc_mag_mean (15 features; motion_flag excluded —
+see the DEVICE_IMU_FEATURES comment).
 """
 
 from __future__ import annotations
@@ -63,10 +66,16 @@ def _drop(cols, remove) -> list:
     return [c for c in cols if c not in rm]
 
 
-# IMU contribution to `device`: motion magnitude and the motion flag only —
-# not the per-axis or sd/absint/peakfreq columns, which the SEN0344/EDA/IMU
-# stack doesn't need to reproduce for a stress read.
-DEVICE_IMU_FEATURES = ["acc_mag_mean", "motion_flag"]
+# IMU contribution to `device`: motion magnitude only. motion_flag was
+# removed: it is a binary indicator whose reference-window IQR is zero for
+# 13/15 subjects, so it fell through the divisor cascade to the unit path and
+# entered the matrix untransformed while every other feature was
+# standardised. Removing it moved binary balanced accuracy by +0.003 — well
+# inside the ~+/-0.15 fold spread, i.e. it carried no measurable information
+# (results/ablation_sweep.csv). It stays in features.FEATURE_NAMES — the
+# cache contract is unchanged — it is just not selected here. motion_fraction
+# is likewise not selected: never evaluated in this set, do not add unverified.
+DEVICE_IMU_FEATURES = ["acc_mag_mean"]
 
 # Everything the deployable hardware can actually produce: the custom EDA
 # front end, the four-feature HR block (see features.py's HR_FEATURES), and
@@ -79,28 +88,23 @@ DEVICE_IMU_FEATURES = ["acc_mag_mean", "motion_flag"]
 #                       doesn't transfer to this device's wrist mount.
 DEVICE_FEATURES = list(F.EDA_FEATURES) + list(F.HR_FEATURES) + DEVICE_IMU_FEATURES
 
-# Six sets, each with a distinct job:
-#   all                every feature in the contract; defined for --features
-#                      but not part of the reported sweep
-#   clean              headline configuration, posture means removed
-#   eda_only           deployment-realistic: the custom EDA front end alone;
-#                      defined for --features but not part of the reported sweep
-#   device             the deployable hardware configuration — see DEVICE_FEATURES
-#   device_nomotionflag  device minus motion_flag — see its definition below
-#   time_only          control, not a result — see sweep_table()
+# Five sets, each with a distinct job:
+#   all        every feature in the contract; available via --features,
+#              not part of the reported sweep
+#   clean      headline configuration, posture means removed (29 features)
+#   eda_only   the custom EDA front end alone; available via --features for
+#              per-modality ablation, not part of the reported sweep
+#   device     the deployable hardware configuration (15) — see DEVICE_FEATURES
+#   time_only  control, not a result — see sweep_table()
 FEATURE_SETS = {
-    "all": list(F.FEATURE_NAMES),
-    "clean": _drop(F.FEATURE_NAMES, POSTURE_FEATURES),
-    "eda_only": list(F.EDA_FEATURES),
-    "device": DEVICE_FEATURES,
-    # motion_flag's reference-window IQR is zero for 13/15 subjects, so it
-    # falls through the divisor cascade to the unit path and enters the
-    # matrix untransformed while every other feature is standardised.
-    "device_nomotionflag": _drop(DEVICE_FEATURES, ["motion_flag"]),
-    "time_only": [TIME_COL],
+    "all": list(F.FEATURE_NAMES),                       # full 33-feature contract
+    "clean": _drop(F.FEATURE_NAMES, POSTURE_FEATURES),  # contract minus the four posture means
+    "eda_only": list(F.EDA_FEATURES),                   # the 10 EDA features alone
+    "device": DEVICE_FEATURES,                          # EDA + HR + acc_mag_mean
+    "time_only": [TIME_COL],                            # elapsed time — the leakage probe
 }
 
-SWEEP_ORDER = ["clean", "device", "device_nomotionflag", "time_only"]
+SWEEP_ORDER = ["clean", "device", "time_only"]  # the reported rows, identical folds and seed
 
 
 def load_table(cache_dir: Path) -> pd.DataFrame:
@@ -144,11 +148,17 @@ def load_baseline_ref_s(cache_dir: Path) -> float | None:
     set touching the HR block. Returns None for a cache built before this
     metadata existed — treat that as unknown, not zero.
     """
-    combined_meta = cache_dir / "wesad_features.meta.json"
+    # Meta sidecars carry the pipeline version, same as the caches they
+    # describe (build_dataset writes wesad_features_v2.meta.json). The
+    # unversioned names previously looked up here matched nothing built by
+    # the current pipeline, so stale sidecars from an older build — or
+    # nothing at all — answered for the current cache.
+    v = F.FEATURE_PIPELINE_VERSION
+    combined_meta = cache_dir / f"wesad_features_v{v}.meta.json"
     if combined_meta.is_file():
-        return json.loads(combined_meta.read_text())["baseline_ref_s"]
+        return json.loads(combined_meta.read_text())["baseline_ref_s"]  # combined cache wins
 
-    metas = sorted(cache_dir.glob("S*_features.meta.json"))
+    metas = sorted(cache_dir.glob(f"S*_features_v{v}.meta.json"))  # else per-subject sidecars
     if not metas:
         return None
     values = {json.loads(p.read_text())["baseline_ref_s"] for p in metas}
@@ -172,9 +182,18 @@ def diagnose_time_confound(df: pd.DataFrame, top: int = 15) -> pd.DataFrame:
     """Per-subject correlation of each feature with elapsed recording time.
 
     Distinguishes 'the model reads a clock' from 'the model reads physiology'.
-    |r| > 0.8 is a strong clock; 0.5-0.8 warrants comment. WESAD runs its
-    condition blocks in a fixed order, so this is the confound behind
-    time_only outscoring every physiological configuration.
+    |r| > 0.8 is a strong clock; 0.5-0.8 warrants comment.
+
+    Mechanism, verified against the per-subject quest files: WESAD DOES
+    counterbalance stress/amusement order (8 amusement-first, 7 stress-first),
+    but counterbalancing does not neutralise session position. The stress
+    block (~10 min labelled) is ~2x the amusement block (~5.5 min), an
+    unlabelled TSST prep delays labelled stress onset, and the meditation
+    blocks excluded by the 3-class scope occupy exactly the intervals where
+    the opposite order-group would provide counter-evidence. Pooled across
+    subjects, stress occupies a ~31-70 min corridor of which ~80% contains no
+    non-stress window from any subject — which is why elapsed time alone
+    reaches ~0.96 binary balanced accuracy under LOSO.
     """
     cols = [c for c in F.FEATURE_NAMES if c in df.columns]
     per_subject = {}
@@ -257,10 +276,10 @@ def _standardise_core(
     if mode == "none":
         return df, None
 
-    out = df.copy()
-    cols = [c for c in F.FEATURE_NAMES if c in df.columns]
-    cohort_iqr = df[cols].quantile(0.75) - df[cols].quantile(0.25)
-    fallback_rows = []
+    out = df.copy()  # scaled copy; the caller's frame is left untouched
+    cols = [c for c in F.FEATURE_NAMES if c in df.columns]  # only contract columns are scaled
+    cohort_iqr = df[cols].quantile(0.75) - df[cols].quantile(0.25)  # last-resort divisor, pooled over everyone
+    fallback_rows = []  # per subject: which cascade level each feature's divisor came from
 
     for sid, idx in df.groupby("subject").groups.items():
         block = df.loc[idx, cols]
@@ -289,11 +308,11 @@ def _standardise_core(
         level[(~used_ref) & (~used_subj) & (~used_cohort)] = "unit"
         fallback_rows.append(pd.Series(level, name=sid))
 
-        scale = iqr.where(iqr > 0, subj_iqr).where(lambda s: s > 0, cohort_iqr)
-        scale = scale.where(scale > 0, 1.0)
-        out.loc[idx, cols] = ((block - centre) / scale).to_numpy()
+        scale = iqr.where(iqr > 0, subj_iqr).where(lambda s: s > 0, cohort_iqr)  # cascade: reference -> subject -> cohort
+        scale = scale.where(scale > 0, 1.0)  # unit divisor only if every level was degenerate
+        out.loc[idx, cols] = ((block - centre) / scale).to_numpy()  # robust z-score for this subject's rows
 
-    out[cols] = out[cols].clip(-Z_CLIP, Z_CLIP).fillna(0.0)
+    out[cols] = out[cols].clip(-Z_CLIP, Z_CLIP).fillna(0.0)  # bound degenerate divisors, then NaN -> 0
     return out, pd.DataFrame(fallback_rows)
 
 
@@ -630,8 +649,10 @@ def sweep_table(rows: list) -> None:
         "\n              other row inherits that as a caveat."
         "\n  clean       headline configuration: posture means removed."
         "\n  device      deployable hardware configuration — EDA front end +"
-        "\n              the four-feature HR block + motion magnitude/flag,"
-        "\n              exactly what the SEN0344/EDA/IMU stack can produce."
+        "\n              the four-feature HR block + motion magnitude"
+        "\n              (acc_mag_mean), exactly what the SEN0344/EDA/IMU"
+        "\n              stack produces. The binary motion flag is excluded —"
+        "\n              see the DEVICE_IMU_FEATURES comment."
     )
 
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)

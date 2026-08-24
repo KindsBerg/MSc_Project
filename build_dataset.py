@@ -20,6 +20,7 @@ import argparse
 import json
 import sys
 import time
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -27,6 +28,14 @@ import pandas as pd
 
 import features as F
 from wesad_loader import LABEL_FS, LABEL_NAMES, SUBJECTS, WRIST_FS, load_subject
+
+# NeuroKit2's eda_peaks calls np.nanmin on windows with zero detected SCRs,
+# raising an all-NaN RuntimeWarning per quiet window. Zero SCRs in a calm
+# baseline window is the physiologically correct outcome, not an error, so
+# the warning is silenced HERE (batch build only) — never in features.py,
+# where the same condition on the live path can mean a real electrode
+# dropout and should stay visible.
+warnings.filterwarnings("ignore", message="All-NaN slice encountered", category=RuntimeWarning)
 
 try:
     from config import WESAD_ROOT

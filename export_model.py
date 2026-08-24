@@ -7,8 +7,8 @@ exact ordered feature list it was trained on, the cohort-level scaling
 fallback, and provenance. Also provides StressModel, the class the live host
 imports to run inference.
 
-    python export_model.py                       # fit 'clean', binary, RF
-    python export_model.py --features eda_only   # deployment-realistic variant
+    python export_model.py                       # fit 'device', binary, RF
+    python export_model.py --features clean      # research-set variant
     python export_model.py --verify              # load and self-test only
 
 Why an artefact rather than a bare pickle
@@ -22,10 +22,13 @@ load and every predict.
 The t_start prohibition
 -----------------------
 t_start scored ~0.96 balanced accuracy alone under LOSO, higher than any
-physiological model, because WESAD runs its condition blocks in a fixed order
-at similar wall-clock offsets for every subject. It has no meaning at
-inference: live monitoring has no protocol and no session start that predicts
-anything. Asserted at export, at load and at predict.
+physiological model. WESAD counterbalances stress/amusement order, but
+unequal block lengths plus the excluded meditation blocks leave ~80% of the
+pooled stress timeline with no non-stress window from any subject, so session
+position still predicts the label (mechanism detailed in
+train_model.diagnose_time_confound). t_start has no meaning at inference:
+live monitoring has no protocol and no session start that predicts anything.
+Asserted at export, at load and at predict.
 
 Standardisation at inference
 ----------------------------
@@ -333,7 +336,7 @@ def export(
     if feature_set in FORBIDDEN_SETS:
         raise ValueError(
             f"feature set '{feature_set}' contains the time probe and cannot "
-            "be deployed. Use 'clean' or 'eda_only'."
+            "be deployed. Use 'device' (deployment) or 'clean' (research)."
         )
 
     df = load_table(cache)
@@ -369,11 +372,13 @@ def export(
         "loso_macro_f1": round(loso["macro_f1_mean"], 4) if loso else None,
         # Recorded so the deployed artefact carries the caveat with it.
         "evaluation_caveat": (
-            "WESAD runs its condition blocks in a fixed order, so elapsed "
-            "session time alone reaches ~0.96 binary balanced accuracy under "
-            "LOSO. Published WESAD benchmarks are therefore upper bounds of "
-            "uncertain composition. Field performance without a protocol clock "
-            "is expected to be lower than the LOSO figure."
+            "Elapsed session time alone reaches ~0.96 binary balanced "
+            "accuracy on WESAD under LOSO: order counterbalancing is "
+            "defeated by unequal block lengths and the excluded meditation "
+            "blocks, so session position still predicts the label. Published "
+            "WESAD benchmarks share this structure and are upper bounds of "
+            "uncertain composition. Field performance without a protocol "
+            "clock is expected to be lower than the LOSO figure."
         ),
     }
 
@@ -458,7 +463,9 @@ def main() -> int:
     ap.add_argument(
         "--features",
         choices=sorted(set(FEATURE_SETS) - FORBIDDEN_SETS),
-        default="clean",
+        # Default is the DEPLOYMENT set — the artefact live_host loads should
+        # be device unless a research variant is asked for explicitly.
+        default="device",
     )
     ap.add_argument("--baseline-n", type=int, default=N_REF_WINDOWS,
                     help=f"reference buffer frozen into the artefact "

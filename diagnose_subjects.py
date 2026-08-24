@@ -281,7 +281,7 @@ def main() -> int:
     ap.add_argument("--out", default="results/subject_diagnostics.csv")
     ap.add_argument(
         "--zero-iqr", nargs="*", default=None, metavar="FEATURE_SET",
-        help="run zero_iqr_exposure() for these feature sets (e.g. clean eda_only) "
+        help="run zero_iqr_exposure() for these feature sets (e.g. clean device) "
              "instead of the responder/reference/magnitude report",
     )
     ap.add_argument("--zero-iqr-out", default="results/zero_iqr_exposure.csv")

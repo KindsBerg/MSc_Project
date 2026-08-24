@@ -75,8 +75,8 @@ class Subject:
         rejected unless at least `purity` of its label samples agree and the
         majority class is in KEEP_LABELS.
         """
-        i0 = int(np.floor(t0 * LABEL_FS))
-        i1 = int(np.ceil(t1 * LABEL_FS))
+        i0 = int(np.floor(t0 * LABEL_FS))  # first label sample covered by the window
+        i1 = int(np.ceil(t1 * LABEL_FS))   # one past the last covered sample
 
         # A window PARTIALLY outside the label track is a caller bug (bad
         # timestamps), not an edge case. Clamping it would score the window on
@@ -91,13 +91,13 @@ class Subject:
                 f"(0..{len(self.label) / LABEL_FS:.1f}s)"
             )
 
-        seg = self.label[max(i0, 0) : min(i1, len(self.label))]
+        seg = self.label[max(i0, 0) : min(i1, len(self.label))]  # label samples inside the window
         if seg.size == 0:
-            return None
-        vals, counts = np.unique(seg, return_counts=True)
-        top = int(vals[np.argmax(counts)])
+            return None  # window sits fully outside the label track
+        vals, counts = np.unique(seg, return_counts=True)  # tally each label code present
+        top = int(vals[np.argmax(counts)])  # majority label
         if counts.max() / seg.size < purity or top not in KEEP_LABELS:
-            return None
+            return None  # impure (straddles a boundary) or out of scope
         return top
 
 
@@ -107,14 +107,14 @@ def load_subject(sid: str, root: str | Path) -> Subject:
     if not path.is_file():
         raise FileNotFoundError(f"missing pickle: {path}")
     with open(path, "rb") as f:
-        d = pickle.load(f, encoding="latin1")  # Python 2 pickle
-    w = d["signal"]["wrist"]
+        d = pickle.load(f, encoding="latin1")  # WESAD pickles are Python 2 era
+    w = d["signal"]["wrist"]  # chest streams exist in d but are never read
 
     def flat(a):
         # 1-D float array, matching the live data format.
         return np.asarray(a, dtype=np.float64).reshape(-1)
 
-    acc = np.asarray(w["ACC"], dtype=np.float64).reshape(-1, 3) / ACC_LSB_PER_G
+    acc = np.asarray(w["ACC"], dtype=np.float64).reshape(-1, 3) / ACC_LSB_PER_G  # raw 1/64 g counts -> g
 
     mag_med = float(np.median(np.linalg.norm(acc, axis=1)))
     if not (ACC_REST_MAG_MIN_G <= mag_med <= ACC_REST_MAG_MAX_G):
